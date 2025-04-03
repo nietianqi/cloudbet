@@ -59,14 +59,18 @@
                 <td>{{ match.price }}</td>
                 <td><code>{{ match.market_url }}</code></td>
                 <td>
-                    <form method="post">
-                        <input type="hidden" name="match" value="{{ match.match }}">
-                        <input type="hidden" name="event_id" value="{{ match.event_id }}">
-                        <input type="hidden" name="market_url" value="{{ match.market_url }}">
-                        <input type="hidden" name="price" value="{{ match.price }}">
-                        <input type="hidden" name="amount" value="{{ bet_amount }}">
-                        <button class="btn btn-primary btn-sm" type="submit">下注</button>
-                    </form>
+                    {% if match.bet_placed %}
+                        <button class="btn btn-secondary btn-sm" disabled>已投注</button>
+                    {% else %}
+                        <form method="post">
+                            <input type="hidden" name="match" value="{{ match.match }}">
+                            <input type="hidden" name="event_id" value="{{ match.event_id }}">
+                            <input type="hidden" name="market_url" value="{{ match.market_url }}">
+                            <input type="hidden" name="price" value="{{ match.price }}">
+                            <input type="hidden" name="amount" value="{{ bet_amount }}">
+                            <button class="btn btn-primary btn-sm" type="submit">下注</button>
+                        </form>
+                    {% endif %}
                 </td>
             </tr>
         {% else %}
@@ -99,6 +103,9 @@
                 <td>{{ log['Balance'] }}</td>
                 <td>{{ log['Notes'] }}</td>
             </tr>
+        {# 用于调试查看每条日志的字典结构 #}
+<tr><td colspan="7"><pre>{{ log }}</pre></td></tr>
+
         {% endfor %}
         </tbody>
     </table>
