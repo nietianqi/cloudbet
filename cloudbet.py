@@ -24,8 +24,6 @@ BASE_URL = "https://sports-api.cloudbet.com/pub/v2/odds/events"
 BET_URL = "https://sports-api.cloudbet.com/pub/v3/bets/place"
 ACCOUNT_URL = "https://sports-api.cloudbet.com/pub/v1/account/currencies"
 
-# 顶级联赛 key（包括足球排名前20国家的一级、二级联赛及其它国家的一级联赛）
-
 # 定义目标盘口和水位范围（主队让1球，即 handicap=-1，且水位在 TARGET_ODDS_LOW ~ TARGET_ODDS_HIGH 范围内）
 TARGET_HANDICAP = "-1"
 TARGET_ODDS_LOW = 1.5
@@ -71,7 +69,6 @@ def load_logs():
                 logs.append(cleaned_row)
     return logs
 
-
 def next_bet_amount(current_balance, logs):
     base_bet = current_balance * START_PERCENT
     bet_amount = base_bet
@@ -103,10 +100,10 @@ def fetch_target_matches():
       1. 参赛联赛为 TOP_LEAGUES（排除虚拟联赛）
       2. 在 asian_handicap 市场中，主队盘口为让1球 (handicap=-1)
          且主队水位在 TARGET_ODDS_LOW ~ TARGET_ODDS_HIGH 范围内
-      3. 比赛开始时间在当前时间到未来 11 分钟内
+      3. 比赛开始时间在当前时间到未来 110 分钟内
     """
     now = int(time.time())
-    future = now + 11 * 60
+    future = now + 110 * 60
     headers = {"X-API-Key": API_KEY}
     params = {
         "sport": "soccer",
@@ -172,7 +169,10 @@ def place_bet(event_id, market_url, price, stake):
     """
     headers = {
         "X-API-Key": API_KEY,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     ref_id = str(uuid.uuid4())
     payload = {
@@ -188,6 +188,8 @@ def place_bet(event_id, market_url, price, stake):
     }
     try:
         response = requests.post(BET_URL, headers=headers, json=payload, timeout=10)
+        # 调试：打印返回的原始响应内容
+        logging.info(f"Response text: {response.text}")
         result_json = response.json()
     except Exception as e:
         logging.error(f"下注请求失败: {e}")
@@ -261,4 +263,4 @@ def index():
     return render_template('index.html', logs=logs, balance=round(current_balance, 2), bet_amount=bet_amount, matches=matches)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
