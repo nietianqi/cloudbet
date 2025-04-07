@@ -103,7 +103,7 @@ def fetch_target_matches():
       3. 比赛开始时间在当前时间到未来 110 分钟内
     """
     now = int(time.time())
-    future = now + 110 * 60
+    future = now + 11 * 60
     headers = {"X-API-Key": API_KEY}
     params = {
         "sport": "soccer",
