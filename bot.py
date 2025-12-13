@@ -3,11 +3,11 @@ Cloudbet 投注机器人 - 主程序
 精简可执行版 - 2.5倍马丁格尔 + 智能筛选
 """
 
-import csv
-import os
 import sys
 import time
 import uuid
+from typing import Dict, Iterable, List
+
 import requests
 import logging
 from datetime import datetime
@@ -18,6 +18,7 @@ from config import (
 )
 from bankroll import next_bet_amount, format_bet_stats, calc_today_pnl
 from matcher import filter_matches, mark_bet_placed, build_market_url, ACTIVE_LEAGUES
+from log_utils import BetLogEntry, BetLogManager
 
 # ========================================
 # 日志配置
@@ -32,63 +33,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# ========================================
-# 日志文件管理
-# ========================================
-
-def init_log_file():
-    """初始化CSV日志文件"""
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "Timestamp", "EventID", "Match", "League",
-                "AHC_Odds", "HomeWin_Odds", "Stake", "LossStreak",
-                "Result", "PnL", "Balance", "Score", "Notes"
-            ])
-        logging.info(f"创建日志文件: {LOG_FILE}")
-
-
-def load_logs():
-    """加载投注日志"""
-    logs = []
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, mode='r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                logs.append(row)
-    return logs
-
-
-def save_log(log_entry):
-    """保存一条投注记录"""
-    with open(LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            log_entry['Timestamp'],
-            log_entry['EventID'],
-            log_entry['Match'],
-            log_entry['League'],
-            log_entry['AHC_Odds'],
-            log_entry['HomeWin_Odds'],
-            log_entry['Stake'],
-            log_entry['LossStreak'],
-            log_entry['Result'],
-            log_entry.get('PnL', ''),
-            log_entry['Balance'],
-            log_entry.get('Score', ''),
-            log_entry['Notes']
-        ])
-
-
-def has_bet_on_event(event_id, logs):
-    """检查是否已对该比赛下注"""
-    for log in logs:
-        if str(log.get('EventID', '')) == str(event_id):
-            return True
-    return False
-
 
 # ========================================
 # 账户和下注
@@ -160,7 +104,7 @@ def place_bet(event_id, market_url, price, stake):
 # 主循环
 # ========================================
 
-def print_banner():
+def print_banner(log_manager: BetLogManager) -> None:
     """打印启动横幅"""
     print("\n" + "="*70)
     print("  Cloudbet 投注机器人 - 精简可执行版")
@@ -170,135 +114,155 @@ def print_banner():
     print(f"  激活联赛: {len(ACTIVE_LEAGUES)} 个")
     print(f"  轮询间隔: {SLEEP_INTERVAL}秒")
     print(f"  模拟模式: {'开启' if DRY_RUN else '关闭'}")
-    print(f"  日志文件: {LOG_FILE}")
+    print(f"  日志文件: {log_manager.log_file}")
     print("="*70)
     print()
 
 
-def main():
-    """主程序"""
-    print_banner()
+def log_match_summary(match: Dict[str, str]) -> None:
+    logging.info("\n🎯 发现目标比赛:")
+    logging.info("  %s vs %s", match['home'], match['away'])
+    logging.info("  联赛: %s", match['league'])
+    logging.info("  让球盘: %s", match['ahc_odds'])
+    logging.info("  独赢: %s", match['home_win_odds'])
+    logging.info("  评分: %s", match['score'])
+    logging.info("  走势: %s", match['trend_reason'])
+    logging.info("  开赛: %.1f分钟后", match['time_to_match'])
 
-    # 初始化
-    init_log_file()
+
+def record_bet(
+    match: Dict[str, str],
+    stake: float,
+    loss_streak: int,
+    balance: float,
+    success: bool,
+    response: Dict[str, str],
+    log_manager: BetLogManager,
+) -> None:
+    result = "ACCEPTED" if success else "FAILED"
+    notes = (
+        f"Score:{match['score']} | {match['trend_reason']} | "
+        f"{response.get('referenceId', 'N/A')}"
+    )
+
+    entry = BetLogEntry(
+        timestamp=datetime.utcnow().isoformat() + 'Z',
+        event_id=str(match['event_id']),
+        match=f"{match['home']} vs {match['away']}",
+        league=match['league'],
+        ahc_odds=float(match['ahc_odds']),
+        home_win_odds=float(match['home_win_odds']),
+        stake=stake,
+        loss_streak=loss_streak,
+        result=result,
+        balance=balance,
+        score=float(match['score']),
+        notes=notes,
+    )
+
+    log_manager.append(entry)
+
+    if success:
+        logging.info("✅ 投注成功！")
+        mark_bet_placed(match['event_id'])
+    else:
+        error_msg = response.get('error', response.get('message', '未知错误'))
+        logging.error("❌ 投注失败: %s", error_msg)
+
+
+def process_matches(
+    matches: Iterable[Dict[str, str]],
+    stake: float,
+    loss_streak: int,
+    balance: float,
+    log_manager: BetLogManager,
+) -> List[Dict[str, str]]:
+    """Iterate over matches and place bets when eligible."""
+
+    logs = log_manager.load()
+    for match in matches:
+        event_id = match['event_id']
+
+        if BetLogManager.has_bet_on_event(event_id, logs):
+            logging.info("已投注过: %s vs %s", match['home'], match['away'])
+            continue
+
+        log_match_summary(match)
+        market_url = build_market_url(match['ahc_odds'])
+        logging.info("\n💰 投注: %s %s @ %s", stake, CURRENCY, match['ahc_odds'])
+
+        success, response = place_bet(
+            event_id,
+            market_url,
+            match['ahc_odds'],
+            stake
+        )
+
+        record_bet(
+            match,
+            stake,
+            loss_streak,
+            balance,
+            success,
+            response,
+            log_manager,
+        )
+
+        # refresh logs to prevent duplicate bets in same round
+        logs = log_manager.load()
+
+    return logs
+
+
+def run_loop(log_manager: BetLogManager) -> None:
     round_count = 0
+    while True:
+        round_count += 1
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        logging.info(f"\n{'='*70}")
+        logging.info(f"第 {round_count} 轮扫描 - {now_str}")
+        logging.info(f"{'='*70}")
+
+        balance = get_balance()
+        logs = log_manager.load()
+        stake, loss_streak, stop_reason = next_bet_amount(logs, balance)
+
+        if stop_reason:
+            logging.warning(f"⚠️  停止下注: {stop_reason}")
+            logging.info(f"当前余额: {balance:.2f} {CURRENCY}")
+
+            if "盈利目标" in stop_reason:
+                logging.info("🎉 达到今日盈利目标，建议收工！")
+
+            time.sleep(SLEEP_INTERVAL * 2)
+            continue
+
+        day_pnl, _ = calc_today_pnl(logs, balance)
+        stats = format_bet_stats(balance, stake, loss_streak, day_pnl)
+        logging.info(f"📊 {stats}")
+
+        matches = filter_matches()
+        if not matches:
+            logging.info("暂无符合条件的比赛")
+            time.sleep(SLEEP_INTERVAL)
+            continue
+
+        process_matches(matches, stake, loss_streak, balance, log_manager)
+        logging.info(f"\n等待 {SLEEP_INTERVAL} 秒...\n")
+        time.sleep(SLEEP_INTERVAL)
+
+
+def main() -> None:
+    log_manager = BetLogManager(LOG_FILE)
+    print_banner(log_manager)
+    log_manager.init_file()
 
     try:
-        while True:
-            round_count += 1
-            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            logging.info(f"\n{'='*70}")
-            logging.info(f"第 {round_count} 轮扫描 - {now_str}")
-            logging.info(f"{'='*70}")
-
-            # 1. 获取账户信息
-            balance = get_balance()
-            logs = load_logs()
-
-            # 2. 计算投注金额
-            stake, loss_streak, stop_reason = next_bet_amount(logs, balance)
-
-            if stop_reason:
-                logging.warning(f"⚠️  停止下注: {stop_reason}")
-                logging.info(f"当前余额: {balance:.2f} {CURRENCY}")
-
-                # 如果是达到盈利目标，可以选择退出
-                if "盈利目标" in stop_reason:
-                    logging.info("🎉 达到今日盈利目标，建议收工！")
-                    # 可以选择 break 退出，或继续监控
-                    # break
-
-                # 等待一段时间再检查
-                time.sleep(SLEEP_INTERVAL * 2)
-                continue
-
-            # 3. 计算今日盈亏
-            day_pnl, day_start_balance = calc_today_pnl(logs, balance)
-
-            # 4. 显示统计
-            stats = format_bet_stats(balance, stake, loss_streak, day_pnl)
-            logging.info(f"📊 {stats}")
-
-            # 5. 筛选比赛
-            matches = filter_matches()
-
-            if not matches:
-                logging.info("暂无符合条件的比赛")
-                time.sleep(SLEEP_INTERVAL)
-                continue
-
-            # 6. 处理候选比赛
-            for match in matches:
-                event_id = match['event_id']
-
-                # 检查是否已投注
-                if has_bet_on_event(event_id, logs):
-                    logging.info(f"已投注过: {match['home']} vs {match['away']}")
-                    continue
-
-                # 显示比赛信息
-                logging.info(f"\n🎯 发现目标比赛:")
-                logging.info(f"  {match['home']} vs {match['away']}")
-                logging.info(f"  联赛: {match['league']}")
-                logging.info(f"  让球盘: {match['ahc_odds']}")
-                logging.info(f"  独赢: {match['home_win_odds']}")
-                logging.info(f"  评分: {match['score']}")
-                logging.info(f"  走势: {match['trend_reason']}")
-                logging.info(f"  开赛: {match['time_to_match']:.1f}分钟后")
-
-                # 构建市场URL
-                market_url = build_market_url(match['ahc_odds'])
-
-                # 执行投注
-                logging.info(f"\n💰 投注: {stake} {CURRENCY} @ {match['ahc_odds']}")
-
-                success, response = place_bet(
-                    event_id,
-                    market_url,
-                    match['ahc_odds'],
-                    stake
-                )
-
-                # 记录日志
-                result = "ACCEPTED" if success else "FAILED"
-                notes = f"Score:{match['score']} | {match['trend_reason']} | {response.get('referenceId', 'N/A')}"
-
-                log_entry = {
-                    'Timestamp': datetime.utcnow().isoformat() + 'Z',
-                    'EventID': event_id,
-                    'Match': f"{match['home']} vs {match['away']}",
-                    'League': match['league'],
-                    'AHC_Odds': match['ahc_odds'],
-                    'HomeWin_Odds': match['home_win_odds'],
-                    'Stake': stake,
-                    'LossStreak': loss_streak,
-                    'Result': result,
-                    'Balance': balance,
-                    'Score': match['score'],
-                    'Notes': notes
-                }
-
-                save_log(log_entry)
-
-                if success:
-                    logging.info(f"✅ 投注成功！")
-                    mark_bet_placed(event_id)
-                else:
-                    error_msg = response.get('error', response.get('message', '未知错误'))
-                    logging.error(f"❌ 投注失败: {error_msg}")
-
-                # 重新加载日志
-                logs = load_logs()
-
-            # 7. 等待下一轮
-            logging.info(f"\n等待 {SLEEP_INTERVAL} 秒...\n")
-            time.sleep(SLEEP_INTERVAL)
-
+        run_loop(log_manager)
     except KeyboardInterrupt:
         logging.info("\n\n用户中断，程序退出")
         sys.exit(0)
-
     except Exception as e:
         logging.error(f"\n\n系统异常: {e}", exc_info=True)
         sys.exit(1)
