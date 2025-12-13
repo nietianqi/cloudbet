@@ -424,7 +424,7 @@ if __name__ == '__main__':
     print(f"  安全区: {SAFE_ODDS_LOW} - {SAFE_ODDS_HIGH}")
     print(f"  独赢上限: {MAX_HOME_WIN_ODDS}")
     print(f"  开赛时间: {MATCH_TIME_BEFORE}分钟")
-    print(f"  核心联赛数: {len(CORE_LEAGUES)}")
+    print(f"  激活联赛数: {len(ACTIVE_LEAGUES)}")
 
     print(f"\n开始筛选...")
     matches = filter_matches()
