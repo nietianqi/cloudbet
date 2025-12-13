@@ -22,20 +22,20 @@ LEAGUE_MODE = 'ALL'  # 启用全部184个联赛
 # ========================================
 # 比赛筛选
 # ========================================
-TARGET_HANDICAP = "-1"          # 主队让1球
-TARGET_ODDS_LOW = 1.2          # 最低赔率
-TARGET_ODDS_HIGH = 1.95         # 最高赔率
+TARGET_HANDICAP = "-0.5"        # 主队让0.5球（-0.5盘口最常见，通过率高）
+TARGET_ODDS_LOW = 1.5           # 最低赔率
+TARGET_ODDS_HIGH = 2.0          # 最高赔率
 
 # ⚠️ 重要：时间窗口设置
 # 当前值 2 表示：离开赛 1.5-2.5 分钟的比赛（很严格）
 # 如果找不到比赛，建议改为 5 或 10
 # 值越大，找到的比赛越多，但赔率可能波动更大
-MATCH_TIME_BEFORE = 1           # 修改为1分钟（查找0.5-1.5分钟窗口的比赛）
+MATCH_TIME_BEFORE = 5           # 修改为5分钟（查找4.5-5.5分钟窗口的比赛）
 
 # 赔率安全区间（二次筛选）
 # 如果找不到比赛，可以禁用（设为与 TARGET_ODDS 相同）
-SAFE_ODDS_LOW = 1.2             # 与 TARGET_ODDS_LOW 保持一致
-SAFE_ODDS_HIGH = 1.95           # 与 TARGET_ODDS_HIGH 保持一致
+SAFE_ODDS_LOW = 1.5             # 与 TARGET_ODDS_LOW 保持一致
+SAFE_ODDS_HIGH = 2.0            # 与 TARGET_ODDS_HIGH 保持一致
 
 # 主胜1X2赔率要求（表示真·强队）
 # 值越小越严格，如果找不到比赛可以放宽到 1.70
