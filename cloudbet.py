@@ -176,15 +176,13 @@ def place_bet(event_id, market_url, price, stake):
     }
     ref_id = str(uuid.uuid4())
     payload = {
-        "referenceId": ref_id,
-        "customerReference": ref_id,
+        "referenceId": ref_id,   # UUID v4，每次下注必须唯一
         "stake": str(stake),
         "price": str(price),
         "eventId": str(event_id),
         "marketUrl": market_url,
         "currency": "USDT",
-        "side": "BACK",
-        "acceptPriceChange": "BETTER"
+        "acceptPriceChange": "BETTER"  # 接受更优赔率
     }
     try:
         response = requests.post(BET_URL, headers=headers, json=payload, timeout=10)
