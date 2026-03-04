@@ -117,3 +117,34 @@ MIN_MATCH_SCORE = 8.0           # 高评分
 
 查看更多帮助：常见问题解决.md
 """
+
+# ========================================
+# NBA 直播总分策略配置（nba_bot.py 使用）
+# ========================================
+# 快速开始：
+#   python nba_bot.py --dry-run           # 先用模拟模式观察信号
+#   python nba_bot.py --play --dry-run    # 用测试资金，模拟不下单
+#   python nba_bot.py --play              # 用 PLAY_EUR 测试资金真实下单
+#   python nba_bot.py --real              # 用 USDT 真实资金（谨慎）
+
+# 信号阈值（越高越保守，但信号越少）
+NBA_EDGE_THRESHOLD = 0.05       # 最小 edge：5%
+NBA_MIN_REMAINING = 6.0         # 距结束至少剩 6 分钟入场
+NBA_STABLE_WINDOW = 20          # 盘口稳定性检测窗口（秒）
+NBA_PRIOR_WEIGHT = 0.45         # 贝叶斯先验权重（0=完全信实时，1=完全信先验）
+
+# 仓位管理
+NBA_KELLY_FRACTION = 0.25       # 1/4 Kelly（推荐保守值）
+NBA_MAX_STAKE_PCT = 0.005       # 单注最大 0.5% 资金
+NBA_MIN_STAKE = 1.0             # 最小注额（USDT）
+
+# 风控熔断
+NBA_DAILY_LOSS_LIMIT = 0.10     # 日内亏损 > 10% 停机
+NBA_MAX_CONSEC_LOSSES = 5       # 连续亏损 5 次停机复盘
+NBA_MAX_REJECTION_RATE = 0.70   # 拒单率 > 70% 停机
+
+# 执行参数
+NBA_SLEEP_INTERVAL = 15         # 轮询间隔（秒）；直播建议 10-20
+NBA_DRY_RUN = True              # 默认模拟模式；改为 False 才真实下单
+NBA_CURRENCY = "PLAY_EUR"       # 测试货币；真实下注改为 "USDT"
+NBA_DB_FILE = "live_betting.db" # SQLite 数据库文件
