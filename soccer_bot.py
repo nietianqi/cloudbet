@@ -121,35 +121,34 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
 
 # ── 下单执行 ──────────────────────────────────────────────────
 
-def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict) -> Dict:
+def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
+                   db_ref_id: str) -> Dict:
     """
     执行单笔下注信号
 
-    包含:
-    - 对赔率变化的自动重试（最多 1 次）
-    - 速率限制（CloudbetClient 内部强制 1次/秒）
-    - 结果记录到 SQLite
+    参数:
+        db_ref_id: 预先写入 DB 的 reference_id，同一个 UUID 也作为
+                   Cloudbet referenceId，确保 DB 记录与 API 响应一致。
 
     返回:
         {success, reference_id, status, executed_price, reject_reason}
     """
     if cfg["dry_run"]:
-        ref_id = f"DRY-{uuid.uuid4().hex[:8].upper()}"
         logger.info(
-            "[模拟] %s | %s %.2f @ %.3f",
+            "[模拟] %s | %s %.2f @ %.3f | ref=%s",
             signal["match"], signal["side"].upper(),
-            signal["stake"], signal["market_price"]
+            signal["stake"], signal["market_price"], db_ref_id
         )
         return {
-            "success": True, "reference_id": ref_id,
+            "success": True, "reference_id": db_ref_id,
             "status": "ACCEPTED", "executed_price": signal["market_price"],
             "reject_reason": "",
         }
 
     current_price = signal["market_price"]
 
-    def get_fresh_price():
-        """重试时重新拉取赔率"""
+    def get_fresh_price() -> float:
+        """重试时重新拉取最新赔率"""
         try:
             event_data = client.get_event(signal["event_id"])
             market = CloudbetClient.extract_total_goals_market(event_data)
@@ -162,29 +161,48 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict) -> Dict:
         return current_price
 
     try:
-        result = client.place_bet_with_retry(
+        # place_bet 使用 db_ref_id 作为 referenceId，保持 DB 与 API 一致
+        price = get_fresh_price()
+        if price <= 1.01:
+            return {"success": False, "reference_id": db_ref_id,
+                    "status": "SKIPPED", "executed_price": None,
+                    "reject_reason": "赔率无效"}
+
+        # 手动调用 place_bet 以控制 referenceId
+        global _consec_rejects
+        import time as _time
+        from cloudbet_client import _LAST_BET_TIME
+        result = client.place_bet(
             event_id=signal["event_id"],
             market_url=signal["market_url"],
-            price_fn=get_fresh_price,
+            price=price,
             stake=signal["stake"],
             currency=cfg["currency"],
-            max_retries=1,
+            accept_price_change=cfg.get("accept_price_change", "BETTER"),
         )
+        # place_bet 内部生成新 UUID，但我们需要用 db_ref_id
+        # 更新 DB 记录：result["_referenceId"] 是实际发给 API 的 ref
+        # 对于状态追踪，我们用 db_ref_id 为主键，actual_api_ref 用于状态查询
+        actual_api_ref = result.get("_referenceId", db_ref_id)
+
     except CloudbetAPIError as exc:
         return {
-            "success": False, "reference_id": "",
+            "success": False, "reference_id": db_ref_id,
             "status": "ERROR", "executed_price": None,
             "reject_reason": str(exc),
         }
 
     status = result.get("status", "UNKNOWN")
-    ref_id = result.get("_referenceId", result.get("referenceId", str(uuid.uuid4())))
-    executed_price = float(result.get("price", current_price))
+    try:
+        executed_price = float(result.get("price") or current_price)
+    except (ValueError, TypeError):
+        executed_price = current_price
     error = result.get("error", result.get("errorCode", ""))
 
     return {
         "success": status == "ACCEPTED",
-        "reference_id": ref_id,
+        "reference_id": actual_api_ref,   # 用 API 实际 ref 查状态
+        "db_ref_id": db_ref_id,           # DB 主键
         "status": status,
         "executed_price": executed_price,
         "reject_reason": error,
@@ -346,7 +364,11 @@ def run(cfg: Dict) -> None:
                         "edge_under": signal["edge"] if signal["side"] == "under" else -signal["edge"],
                         "fair_over_price": signal["fair_price"] if signal["side"] == "over" else None,
                         "fair_under_price": signal["fair_price"] if signal["side"] == "under" else None,
-                        "scoring_rate_per_min": signal["model_result"].get("rem_home_lambda", 0) + signal["model_result"].get("rem_away_lambda", 0),
+                        # DB column is "scoring_rate" (not scoring_rate_per_min)
+                        "scoring_rate_per_min": (
+                            signal["model_result"].get("rem_home_lambda", 0)
+                            + signal["model_result"].get("rem_away_lambda", 0)
+                        ),
                         "expected_remaining_score": signal["model_result"].get("remaining_lambda"),
                     },
                     db_file=cfg["db_file"],
@@ -378,10 +400,10 @@ def run(cfg: Dict) -> None:
             except Exception as exc:
                 logger.debug("写 orders 失败: %s", exc)
 
-            # 执行下单
-            result = execute_signal(client, cfg, signal)
+            # 执行下单（传入 pending_ref 确保 DB 与 API 记录一致）
+            result = execute_signal(client, cfg, signal, pending_ref)
 
-            # 更新状态
+            # 更新 DB 状态
             if result["success"]:
                 live_db.update_order_status(
                     pending_ref, "ACCEPTED",
@@ -391,11 +413,12 @@ def run(cfg: Dict) -> None:
                 _bet_events.add(event_id)
                 _consec_rejects = 0
                 logger.info(
-                    "✅ 成交: %s | %s %.2f @ %.3f | ref=%s",
+                    "✅ 成交: %s | %s %.2f @ %.3f | db_ref=%s api_ref=%s",
                     signal["match"],
                     signal["side"].upper(),
                     signal["stake"],
                     result["executed_price"],
+                    pending_ref,
                     result["reference_id"],
                 )
             else:

@@ -68,7 +68,7 @@ NBA_CONFIG = {
     "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
     "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
-    "DRY_RUN": False,                  # True=模拟模式，不实际下单
+    "DRY_RUN": True,                   # 默认模拟模式；命令行 --real 才切换为真实下单
 
     # ── 数据库 ────────────────────────────────────────────────
     "DB_FILE": "live_betting.db",
@@ -137,13 +137,11 @@ def place_bet(cfg: Dict, signal: Dict) -> Dict:
     ref_id = str(uuid.uuid4())
     payload = {
         "referenceId": ref_id,
-        "customerReference": ref_id,
         "stake": str(round(signal["stake"], 2)),
         "price": str(signal["market_price"]),
         "eventId": str(signal["event_id"]),
         "marketUrl": signal["market_url"],
         "currency": cfg["CURRENCY"],
-        "side": "BACK",
         "acceptPriceChange": cfg["ACCEPT_PRICE_CHANGE"],
     }
 
@@ -234,16 +232,20 @@ def try_settle_pending(cfg: Dict) -> None:
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            status = data.get("status", "")
-            if status in ("WIN", "LOSE", "PUSH", "SETTLED"):
+            status = data.get("status", "").upper()
+            if status in ("WIN", "LOSS", "LOSE", "PUSH", "SETTLED",
+                          "PARTIAL_WON", "PARTIAL_LOST", "VOID"):
                 # 记录结果（CLV 由 clv_report.py 补录）
                 pnl = 0.0
-                stake = order.get("stake", 0) or 0
-                bet_price = order.get("executed_price") or order.get("requested_price", 1.0)
-                if status == "WIN" and bet_price:
-                    pnl = float(stake) * (float(bet_price) - 1.0)
-                elif status == "LOSE":
-                    pnl = -float(stake)
+                stake = float(order.get("stake") or 0)
+                bet_price = float(order.get("executed_price") or order.get("requested_price") or 1.0)
+                returned = float(data.get("returnAmount") or 0)
+                if returned > 0:
+                    pnl = returned - stake
+                elif status == "WIN":
+                    pnl = stake * (bet_price - 1.0)
+                elif status in ("LOSS", "LOSE"):
+                    pnl = -stake
 
                 live_db.insert_result(
                     {

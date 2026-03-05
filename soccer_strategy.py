@@ -68,11 +68,13 @@ def _update_odds_cache(event_id: str, over_price: float, under_price: float) -> 
     _odds_cache[event_id] = [
         entry for entry in _odds_cache[event_id] if entry[0] >= cutoff
     ]
-    # 清理长时间不活跃的赛事
-    stale = [eid for eid, hist in _odds_cache.items()
-             if not hist or (now - hist[-1][0]) > _CACHE_TTL]
-    for eid in stale:
-        del _odds_cache[eid]
+    # 收集过期 key 后统一删除（避免 dict-deletion-during-iteration 崩溃）
+    stale_keys = [
+        eid for eid, hist in _odds_cache.items()
+        if not hist or (now - hist[-1][0]) > _CACHE_TTL
+    ]
+    for eid in stale_keys:
+        _odds_cache.pop(eid, None)
 
 
 def _is_odds_stable(
@@ -88,13 +90,16 @@ def _is_odds_stable(
     """
     history = _odds_cache.get(event_id, [])
     now = time.time()
-    recent = [(ts, op, _) for ts, op, _ in history if now - ts <= window_secs]
+    recent = [(ts, op, up) for ts, op, up in history if now - ts <= window_secs]
 
     if len(recent) < 2:
         return True, "数据不足，默认稳定"
 
     over_prices = [op for _, op, _ in recent]
-    max_jump = max(over_prices) - min(over_prices)
+    under_prices = [up for _, _, up in recent]
+    max_jump_over = max(over_prices) - min(over_prices)
+    max_jump_under = max(under_prices) - min(under_prices)
+    max_jump = max(max_jump_over, max_jump_under)
 
     if max_jump > jump_threshold:
         return False, f"盘口跳动 {max_jump:.3f} > 阈值 {jump_threshold}"
@@ -241,11 +246,9 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             continue
 
         # ── 比赛时间检查 ──────────────────────────────────
-        remaining_minutes = max(90.0 - elapsed, 0.0)
-
-        # 加时处理（elapsed > 90）
-        if elapsed > 90:
-            remaining_minutes = max(95.0 - elapsed, 0.0)
+        # 90 分钟正常时间，加时最多按 96 分钟估算（6 分钟补时）
+        total_estimated = 90.0 if elapsed <= 90 else 96.0
+        remaining_minutes = max(total_estimated - elapsed, 0.0)
 
         if remaining_minutes < min_remaining:
             logger.debug("[%s] 剩余 %.1f 分钟 < 最低 %.1f，跳过",

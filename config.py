@@ -5,7 +5,8 @@
 # ========================================
 # API 配置
 # ========================================
-API_KEY = "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA"
+import os as _os
+API_KEY = _os.environ.get("CLOUDBET_API_KEY", "")  # 通过环境变量设置：export CLOUDBET_API_KEY=your_key
 
 BASE_URL = "https://sports-api.cloudbet.com/pub/v2/odds/events"
 BET_URL = "https://sports-api.cloudbet.com/pub/v3/bets/place"
@@ -84,7 +85,7 @@ INITIAL_BALANCE = 100           # 备用初始余额
 # ========================================
 # 高级选项
 # ========================================
-DRY_RUN = False                # 真实下单模式（实际下注）⚠️
+DRY_RUN = True                 # 默认模拟模式；改为 False 才真实下单 ⚠️
 VERBOSE = False                 # 详细日志（改为 False 减少日志）
 
 # ========================================

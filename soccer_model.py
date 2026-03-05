@@ -282,24 +282,25 @@ class InPlayGoalsModel:
         score_diff = goals_home - goals_away
         h_mult, a_mult = _game_state_adjustment(score_diff, minute, red_home, red_away)
 
-        rem_h *= h_mult
-        rem_a *= a_mult
+        rem_h = max(rem_h * h_mult, 0.0)  # guard against negative after mult
+        rem_a = max(rem_a * a_mult, 0.0)
         lam = rem_h + rem_a   # 总剩余期望进球
 
         # Poisson 计算
         p_over = poisson_over_prob(goals_needed, lam)
         p_under = 1.0 - p_over
 
-        # 公平赔率（去水前）
+        # 公平赔率（去水前）；极端情况限制赔率最大 999
         fair_over = round(1.0 / max(p_over, 0.001), 3)
         fair_under = round(1.0 / max(p_under, 0.001), 3)
 
-        # 估算 live 权重（用于日志透明度）
-        elapsed_frac = max(minute, 1) / (90 + extra_time)
+        # blend_weight 仅用于日志透明度，单点计算避免重复
+        total_mins = max(90 + extra_time, 1)
+        elapsed_frac = max(minute, 1) / total_mins
         if minute < 10:
             blend_w = 0.08
         else:
-            blend_w = self.live_weight * elapsed_frac + (1 - self.live_weight) * 0.25
+            blend_w = min(self.live_weight * elapsed_frac + (1 - self.live_weight) * 0.25, 0.95)
 
         return {
             "over": round(p_over, 4),
@@ -310,7 +311,7 @@ class InPlayGoalsModel:
             "rem_home_lambda": round(rem_h, 3),
             "rem_away_lambda": round(rem_a, 3),
             "goals_needed": round(goals_needed, 1),
-            "blend_weight": round(min(blend_w, 0.95), 3),
+            "blend_weight": round(blend_w, 3),
         }
 
     def compute_edge(

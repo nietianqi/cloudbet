@@ -22,6 +22,7 @@ import logging
 import time
 import uuid
 from typing import Dict, List, Optional
+from urllib.parse import urlencode, parse_qs
 
 import requests
 
@@ -29,11 +30,10 @@ logger = logging.getLogger(__name__)
 
 BASE = "https://sports-api.cloudbet.com"
 
-# 下注后允许等待的最长结算时间（秒）
 _SETTLEMENT_TIMEOUT = 300
 _SETTLEMENT_INTERVAL = 5
 
-# 下单速率限制：1 次/秒
+# 下单速率限制：1 次/秒（全局，非线程安全，单线程使用）
 _LAST_BET_TIME: float = 0.0
 
 # 已知拒单错误代码及建议动作
@@ -47,6 +47,11 @@ REJECTION_ACTIONS: Dict[str, str] = {
     "INSUFFICIENT_BALANCE": "stop",
     "RESTRICTED": "stop",
 }
+
+# 结算终止状态集合
+TERMINAL_STATUSES = frozenset(
+    {"ACCEPTED", "WIN", "LOSS", "VOID", "PARTIAL_WON", "PARTIAL_LOST", "REJECTED"}
+)
 
 
 class CloudbetAPIError(Exception):
@@ -82,25 +87,41 @@ class CloudbetClient:
 
     def _get(self, path: str, params: dict = None) -> dict:
         url = f"{BASE}{path}"
-        resp = self.session.get(url, params=params, timeout=self.timeout)
+        try:
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise CloudbetAPIError(0, f"网络请求失败: {exc}") from exc
         if resp.status_code == 401:
             raise CloudbetAPIError(401, "API Key 无效或已过期")
+        if resp.status_code == 404:
+            raise CloudbetAPIError(404, f"资源不存在: {path}")
         if resp.status_code == 429:
             raise CloudbetAPIError(429, "请求频率超限（Rate limit exceeded）")
         if resp.status_code >= 500:
             raise CloudbetAPIError(resp.status_code, f"服务器错误: {resp.text[:200]}")
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise CloudbetAPIError(resp.status_code, f"JSON 解析失败: {resp.text[:100]}") from exc
 
     def _post(self, path: str, payload: dict) -> dict:
         url = f"{BASE}{path}"
-        resp = self.session.post(url, json=payload, timeout=self.timeout)
+        try:
+            resp = self.session.post(url, json=payload, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise CloudbetAPIError(0, f"网络请求失败: {exc}") from exc
         if resp.status_code == 401:
             raise CloudbetAPIError(401, "API Key 无效或已过期")
         if resp.status_code == 400:
             raise CloudbetAPIError(400, f"请求格式错误: {resp.text[:300]}")
+        if resp.status_code == 404:
+            raise CloudbetAPIError(404, f"端点不存在: {path}")
         if resp.status_code >= 500:
             raise CloudbetAPIError(resp.status_code, f"服务器错误: {resp.text[:200]}")
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise CloudbetAPIError(resp.status_code, f"JSON 解析失败: {resp.text[:100]}") from exc
 
     # ── Feed API v2 ───────────────────────────────────────────
 
@@ -234,11 +255,11 @@ class CloudbetClient:
             - 速率限制：1 次/秒，超过则在此方法内自动等待
         """
         global _LAST_BET_TIME
-        # 速率限制：严格 1 次/秒
+        # 速率限制：严格 1 次/秒（use max to guard against negative sleep）
         now = time.time()
-        since_last = now - _LAST_BET_TIME
-        if since_last < 1.0:
-            time.sleep(1.0 - since_last)
+        wait = 1.0 - (now - _LAST_BET_TIME)
+        if wait > 0:
+            time.sleep(wait)
 
         ref_id = str(uuid.uuid4())
         payload = {
@@ -330,7 +351,7 @@ class CloudbetClient:
 
         终止状态: ACCEPTED, WIN, LOSS, VOID, PARTIAL_WON, PARTIAL_LOST, REJECTED
         """
-        terminal = {"ACCEPTED", "WIN", "LOSS", "VOID", "PARTIAL_WON", "PARTIAL_LOST", "REJECTED"}
+        terminal = TERMINAL_STATUSES
         deadline = time.time() + timeout
 
         while time.time() < deadline:
@@ -359,7 +380,11 @@ class CloudbetClient:
         真实货币: BTC, ETH, USDT, USDC, EUR, USD, CAD, BCH 等
         """
         raw = self._get(f"/pub/v1/account/currencies/{currency}/balance")
-        return float(raw.get("amount", 0))
+        try:
+            return float(raw.get("amount") or 0)
+        except (ValueError, TypeError):
+            logger.warning("无法解析余额响应: %s", raw)
+            return 0.0
 
     # ── Market URL 构建工具 ───────────────────────────────────
 
@@ -423,35 +448,41 @@ class CloudbetClient:
 
         result: dict = {}
         for sel in selections:
-            params = sel.get("params", "")
+            sel_params = sel.get("params", "")
             outcome = sel.get("outcome", "")
             price = sel.get("price")
             status = sel.get("status", "")
 
-            if status != "SELECTION_ENABLED" or not price:
+            if status != "SELECTION_ENABLED" or not price or not outcome:
                 continue
 
-            # 解析盘口（如 "total=2.5"）
-            if "total=" in params:
+            # 用 parse_qs 稳健解析参数（如 "total=2.5" 或 "total=2.5&foo=bar"）
+            if "total=" in sel_params and "line" not in result:
                 try:
-                    line = float(params.split("total=")[1].split("&")[0])
-                except (IndexError, ValueError):
+                    qs = parse_qs(sel_params)
+                    result["line"] = float(qs["total"][0])
+                except (KeyError, IndexError, ValueError):
                     continue
-                result["line"] = line
+
+            try:
+                price_f = float(price)
+            except (ValueError, TypeError):
+                continue
 
             if outcome == "over":
-                result["over_price"] = float(price)
-                result["over_min_stake"] = float(sel.get("minStake", 0))
-                result["over_max_stake"] = float(sel.get("maxStake", 9999))
-                result["over_url"] = f"soccer.total_goals/over?total={result.get('line', '')}"
-
+                result["over_price"] = price_f
+                result["over_min_stake"] = float(sel.get("minStake") or 0)
+                result["over_max_stake"] = float(sel.get("maxStake") or 9999)
             elif outcome == "under":
-                result["under_price"] = float(price)
-                result["under_min_stake"] = float(sel.get("minStake", 0))
-                result["under_max_stake"] = float(sel.get("maxStake", 9999))
-                result["under_url"] = f"soccer.total_goals/under?total={result.get('line', '')}"
+                result["under_price"] = price_f
+                result["under_min_stake"] = float(sel.get("minStake") or 0)
+                result["under_max_stake"] = float(sel.get("maxStake") or 9999)
 
+        # 构建 URL 仅在 line 确认后（避免空字符串 URL）
         if "over_price" in result and "under_price" in result and "line" in result:
+            line = result["line"]
+            result["over_url"] = f"soccer.total_goals/over?total={line}"
+            result["under_url"] = f"soccer.total_goals/under?total={line}"
             return result
         return None
 
