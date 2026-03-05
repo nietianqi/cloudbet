@@ -294,8 +294,13 @@ def create_xg_client(api_key: str = None) -> "APIFootballClient | NullXGClient":
     参数优先级:
       1. 传入参数 api_key
       2. 环境变量 API_FOOTBALL_KEY
+      3. 兼容旧变量 APIFOOTBALL_KEY
     """
-    key = api_key or os.environ.get("API_FOOTBALL_KEY", "")
+    key = (
+        api_key
+        or os.environ.get("API_FOOTBALL_KEY", "")
+        or os.environ.get("APIFOOTBALL_KEY", "")
+    )
     if key:
         logger.info("使用 API-Football 真实 xG 数据")
         return APIFootballClient(key)
@@ -349,7 +354,7 @@ if __name__ == "__main__":
         print(f"  比分={gh}-{ga} | {min_}分 | est_xG={eh:.3f}/{ea:.3f}")
 
     # 如果有 key，测试真实 API
-    key = os.environ.get("API_FOOTBALL_KEY", "")
+    key = os.environ.get("API_FOOTBALL_KEY", "") or os.environ.get("APIFOOTBALL_KEY", "")
     if key:
         client = APIFootballClient(key)
         print("\n── API-Football 直播赛事 ────────")
@@ -361,4 +366,4 @@ if __name__ == "__main__":
             print(f"  统计数据({fid}): {stats}")
     else:
         print("\n未设置 API_FOOTBALL_KEY，跳过真实 API 测试")
-        print("设置方式: export API_FOOTBALL_KEY=your_key")
+        print("设置方式: export API_FOOTBALL_KEY=your_key (或旧变量 APIFOOTBALL_KEY)")
