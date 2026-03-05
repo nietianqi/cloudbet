@@ -168,10 +168,8 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
                     "status": "SKIPPED", "executed_price": None,
                     "reject_reason": "赔率无效"}
 
-        # 手动调用 place_bet 以控制 referenceId
+        # 传入 db_ref_id 作为 referenceId，确保 DB 与 Cloudbet API 使用同一个 UUID
         global _consec_rejects
-        import time as _time
-        from cloudbet_client import _LAST_BET_TIME
         result = client.place_bet(
             event_id=signal["event_id"],
             market_url=signal["market_url"],
@@ -179,11 +177,9 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             stake=signal["stake"],
             currency=cfg["currency"],
             accept_price_change=cfg.get("accept_price_change", "BETTER"),
+            reference_id=db_ref_id,
         )
-        # place_bet 内部生成新 UUID，但我们需要用 db_ref_id
-        # 更新 DB 记录：result["_referenceId"] 是实际发给 API 的 ref
-        # 对于状态追踪，我们用 db_ref_id 为主键，actual_api_ref 用于状态查询
-        actual_api_ref = result.get("_referenceId", db_ref_id)
+        actual_api_ref = result.get("_referenceId", db_ref_id)  # 应等于 db_ref_id
 
     except CloudbetAPIError as exc:
         return {

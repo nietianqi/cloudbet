@@ -229,6 +229,7 @@ class CloudbetClient:
         stake: float,
         currency: str = "PLAY_EUR",
         accept_price_change: str = "BETTER",
+        reference_id: Optional[str] = None,
     ) -> dict:
         """
         提交下注请求
@@ -245,6 +246,9 @@ class CloudbetClient:
               "NONE"   — 拒绝任何赔率变化（最保守）
               "BETTER" — 只接受更优赔率（推荐）
               "ALL"    — 接受任何变化（慎用）
+            reference_id      : 可选，调用方传入已存入 DB 的 UUID，确保 DB 与
+                                API 使用同一个 referenceId，便于状态追踪和结算。
+                                若不传则自动生成新 UUID。
 
         返回:
             response dict，包含 status: ACCEPTED / REJECTED / PENDING
@@ -261,7 +265,7 @@ class CloudbetClient:
         if wait > 0:
             time.sleep(wait)
 
-        ref_id = str(uuid.uuid4())
+        ref_id = reference_id if reference_id else str(uuid.uuid4())
         payload = {
             "referenceId": ref_id,
             "eventId": str(event_id),
