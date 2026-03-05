@@ -256,7 +256,10 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             continue
 
         # ── 获取 xG 数据 ──────────────────────────────────
-        af_fixture_id = event.get("_af_fixture_id")   # 若有匹配则填入
+        # _af_fixture_id 需要外部将 Cloudbet 队名与 API-Football 赛程匹配后注入。
+        # Cloudbet Feed API 不提供 API-Football fixture_id，默认为 None，
+        # 此时 _get_live_xg() 自动回退到基于比分+时间的 xG 估算。
+        af_fixture_id = event.get("_af_fixture_id")
         live_xg_h, live_xg_a, game_state = _get_live_xg(
             xg_client, af_fixture_id,
             goals_home, goals_away, elapsed,

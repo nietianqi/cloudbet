@@ -327,7 +327,7 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             if current_score is None:
                 # 无法获取实时比分，用先验节奏估算（保守处理）
                 expected_so_far = (elapsed_minutes / 48.0) * line
-                current_score = int(expected_so_far)
+                current_score = round(expected_so_far)
                 logger.debug(
                     "[%s] 无实时比分，估算当前总分=%d", match_name, current_score
                 )
