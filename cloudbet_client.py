@@ -160,6 +160,8 @@ class CloudbetClient:
         params: dict = {}
         if markets:
             params["markets"] = markets
+        if status:
+            params["status"] = status
         return self._get(f"/pub/v2/odds/competitions/{competition_key}", params=params)
 
     def get_event(self, event_id: str) -> dict:
@@ -179,7 +181,7 @@ class CloudbetClient:
           RESULTED      — 已结束，市场清空
           CANCELLED     — 已取消
         """
-        data = self.get_events(competition_key, markets)
+        data = self.get_events(competition_key, markets, status="TRADING_LIVE")
         return [e for e in data.get("events", []) if e.get("status") == "TRADING_LIVE"]
 
     def get_all_live_soccer(
@@ -209,7 +211,7 @@ class CloudbetClient:
             if not comp_key:
                 continue
             try:
-                data = self.get_events(comp_key, markets)
+                data = self.get_events(comp_key, markets, status="TRADING_LIVE")
                 for event in data.get("events", []):
                     if event.get("status") == "TRADING_LIVE":
                         event["_competition_key"] = comp_key

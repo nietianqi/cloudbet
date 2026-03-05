@@ -98,4 +98,4 @@ avg_CLV% ≤ 0  →  无 edge，需要重新审视信号质量
 | 变量 | 说明 |
 |------|------|
 | `CLOUDBET_API_KEY` | Trading API Key（必填） |
-| `APIFOOTBALL_KEY` | API-Football Key（可选，提升 xG 精度） |
+| `API_FOOTBALL_KEY` | API-Football Key（可选，提升 xG 精度） |
