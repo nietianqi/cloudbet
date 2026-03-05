@@ -104,8 +104,10 @@ def _extract_totals_market(markets: Dict) -> Optional[Dict]:
                 # 解析盘口
                 if line is None and "points=" in params:
                     try:
-                        line = float(params.split("points=")[1].split("&")[0])
-                    except (IndexError, ValueError):
+                        from urllib.parse import parse_qs
+                        qs = parse_qs(params)
+                        line = float(qs["points"][0])
+                    except (KeyError, IndexError, ValueError):
                         pass
                 if outcome == "over":
                     over_price = price
@@ -218,9 +220,13 @@ def _is_odds_stable(event_id: str, over_price: float,
         return True, "窗口内数据不足"
 
     over_prices = [op for _, op, _ in recent]
-    max_jump = max(over_prices) - min(over_prices)
+    under_prices = [up for _, _, up in recent]
+    over_jump = max(over_prices) - min(over_prices)
+    under_jump = max(under_prices) - min(under_prices)
+    max_jump = max(over_jump, under_jump)
     if max_jump > jump_threshold:
-        return False, f"Over 盘口跳动 {max_jump:.3f} > {jump_threshold}"
+        side = "Over" if over_jump >= under_jump else "Under"
+        return False, f"{side} 盘口跳动 {max_jump:.3f} > {jump_threshold}"
 
     return True, f"稳定 (最大跳动 {max_jump:.3f})"
 
@@ -234,13 +240,13 @@ def _update_odds_cache(event_id: str, over_price: float, under_price: float) -> 
     _odds_cache[event_id] = [
         (ts, op, up) for ts, op, up in _odds_cache[event_id] if ts >= cutoff
     ]
-    # 清理长时间没有更新的赛事
+    # 清理长时间没有更新的赛事（先收集 key，再删除，避免迭代中修改字典）
     stale_events = [
         eid for eid, hist in _odds_cache.items()
         if not hist or (now - hist[-1][0]) > _CACHE_TTL
     ]
     for eid in stale_events:
-        del _odds_cache[eid]
+        _odds_cache.pop(eid, None)
 
 
 def generate_signals(cfg: Dict) -> List[Dict]:

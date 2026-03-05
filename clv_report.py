@@ -107,8 +107,10 @@ def settle_pending_orders(api_key: str, db_file: str) -> int:
         if not data:
             continue
 
-        status = data.get("status", "")
-        if status not in ("WIN", "LOSE", "PUSH", "SETTLED"):
+        status = data.get("status", "").upper()
+        terminal = {"WIN", "LOSS", "LOSE", "PUSH", "SETTLED",
+                    "PARTIAL_WON", "PARTIAL_LOST", "VOID"}
+        if status not in terminal:
             continue
 
         stake = float(order.get("stake") or 0)
@@ -119,12 +121,20 @@ def settle_pending_orders(api_key: str, db_file: str) -> int:
         side = order.get("side", "over")
         clv_info = compute_clv(bet_price, closing_price, side)
 
-        # 计算 PnL
-        pnl = 0.0
-        if status == "WIN":
+        # 计算 PnL（优先用平台返回的 returnAmount）
+        returned = float(data.get("returnAmount") or 0)
+        if returned > 0:
+            pnl = returned - stake
+        elif status == "WIN":
             pnl = stake * (bet_price - 1.0)
-        elif status == "LOSE":
+        elif status in ("LOSS", "LOSE"):
             pnl = -stake
+        elif status == "PARTIAL_WON":
+            pnl = returned - stake if returned > 0 else stake * (bet_price - 1.0) * 0.5
+        elif status == "PARTIAL_LOST":
+            pnl = returned - stake if returned > 0 else -stake * 0.5
+        else:  # PUSH / VOID
+            pnl = 0.0
 
         # 写入 results 表
         live_db.insert_result(

@@ -380,15 +380,12 @@ def get_clv_summary(db_file: str = DB_FILE) -> Dict:
 
 def get_recent_orders_count(minutes: int = 30, db_file: str = DB_FILE) -> int:
     """返回最近 N 分钟内的已成交订单数（用于控频）"""
+    from datetime import timedelta
     conn = get_connection(db_file)
-    cutoff = datetime.utcnow().isoformat()
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat() + "Z"
     row = conn.execute(
-        """
-        SELECT COUNT(*) AS cnt FROM orders
-        WHERE status = 'ACCEPTED'
-          AND timestamp >= datetime(?, '-' || ? || ' minutes')
-        """,
-        (cutoff, minutes),
+        "SELECT COUNT(*) AS cnt FROM orders WHERE status = 'ACCEPTED' AND timestamp >= ?",
+        (cutoff,),
     ).fetchone()
     conn.close()
     return row["cnt"] if row else 0

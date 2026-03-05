@@ -71,7 +71,8 @@ def estimate_scoring_rate(
     if elapsed_minutes < 0.5:
         return prior_rate
 
-    observed_rate = current_score / elapsed_minutes
+    # Guard: elapsed_minutes validated > 0 above
+    observed_rate = current_score / max(elapsed_minutes, 0.001)
 
     # 随比赛进行降低先验权重（线性退火）
     time_progress = min(elapsed_minutes / NBA_REGULATION_MINUTES, 1.0)
