@@ -28,9 +28,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-import requests
-
 from nba_model import compute_live_total_edge, pick_best_side, kelly_stake
+from cloudbet_client import CloudbetClient, CloudbetAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -62,25 +61,52 @@ def fetch_live_basketball_events(api_key: str) -> List[Dict]:
     """
     拉取所有 TRADING_LIVE 篮球赛事
 
+    说明：
+      直接请求 /pub/v2/odds/events 在部分参数组合下会触发 400。
+      这里改为“先拉 basketball competitions，再逐联赛拉 TRADING_LIVE”
+      的稳定路径，与 soccer 策略保持一致。
+
     返回：competition list（原始 API 结构）
     """
-    headers = {"X-API-Key": api_key}
-    params = {
-        "sport": "basketball",
-        "status": "TRADING_LIVE",
-        "markets": "basketball.totals",
-        "limit": 200,
-    }
+    client = CloudbetClient(api_key)
+    competitions: List[Dict] = []
+
     try:
-        resp = requests.get(EVENTS_URL, headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            return resp.json().get("competitions", [])
-        logger.warning("API 返回 %d: %s", resp.status_code, resp.text[:200])
-        return []
-    except requests.RequestException as exc:
-        logger.error("拉取赛事失败: %s", exc)
+        comp_resp = client.get_competitions("basketball")
+    except CloudbetAPIError as exc:
+        logger.warning("拉取篮球联赛失败: %s", exc)
         return []
 
+    comp_keys = [
+        c.get("key", "")
+        for c in comp_resp.get("competitions", [])
+        if c.get("key") and "virtual" not in c.get("name", "").lower()
+    ]
+
+    for comp_key in comp_keys:
+        try:
+            data = client.get_events(
+                comp_key,
+                markets=["basketball.totals"],
+                status="TRADING_LIVE",
+            )
+        except CloudbetAPIError as exc:
+            logger.debug("扫描联赛失败 %s: %s", comp_key, exc)
+            continue
+
+        events = [e for e in data.get("events", []) if e.get("status") == "TRADING_LIVE"]
+        if not events:
+            continue
+
+        competitions.append(
+            {
+                "key": comp_key,
+                "name": data.get("name", comp_key),
+                "events": events,
+            }
+        )
+
+    return competitions
 
 def _extract_totals_market(markets: Dict) -> Optional[Dict]:
     """
@@ -90,41 +116,67 @@ def _extract_totals_market(markets: Dict) -> Optional[Dict]:
         {line, over_price, under_price, market_url_over, market_url_under}
         或 None
     """
+    from urllib.parse import parse_qs
+
     for market_key, market in markets.items():
         if "totals" not in market_key.lower():
             continue
-        for sub_key, sub in market.get("submarkets", {}).items():
-            over_price = under_price = line = None
+
+        for _, sub in market.get("submarkets", {}).items():
+            over_price = under_price = None
+            over_url = under_url = ""
+            line = None
+            line_key = "points"
+
             for sel in sub.get("selections", []):
-                outcome = sel.get("outcome", "").lower()
-                price = sel.get("price")
-                params = sel.get("params", "")  # e.g. "points=228.5"
-                if not price:
+                if sel.get("status") not in (None, "SELECTION_ENABLED"):
                     continue
-                # 解析盘口
-                if line is None and "points=" in params:
-                    try:
-                        from urllib.parse import parse_qs
-                        qs = parse_qs(params)
-                        line = float(qs["points"][0])
-                    except (KeyError, IndexError, ValueError):
-                        pass
+
+                outcome = str(sel.get("outcome", "")).lower()
+                if outcome not in ("over", "under"):
+                    continue
+
+                try:
+                    price = float(sel.get("price"))
+                except (TypeError, ValueError):
+                    continue
+
+                params = str(sel.get("params", ""))
+                if line is None and params:
+                    qs = parse_qs(params)
+                    for key in ("points", "total", "line"):
+                        if key in qs:
+                            try:
+                                line = float(qs[key][0])
+                                line_key = key
+                                break
+                            except (TypeError, ValueError, IndexError):
+                                continue
+
                 if outcome == "over":
                     over_price = price
-                elif outcome == "under":
+                    over_url = str(sel.get("url") or "")
+                else:
                     under_price = price
+                    under_url = str(sel.get("url") or "")
 
-            if over_price and under_price and line:
-                return {
-                    "line": line,
-                    "over_price": over_price,
-                    "under_price": under_price,
-                    "market_key": market_key,
-                    "market_url_over": f"{market_key}/over?points={line}",
-                    "market_url_under": f"{market_key}/under?points={line}",
-                }
+            if over_price is None or under_price is None or line is None:
+                continue
+
+            if not over_url:
+                over_url = f"{market_key}/over?{line_key}={line}"
+            if not under_url:
+                under_url = f"{market_key}/under?{line_key}={line}"
+
+            return {
+                "line": line,
+                "over_price": over_price,
+                "under_price": under_price,
+                "market_key": market_key,
+                "market_url_over": over_url,
+                "market_url_under": under_url,
+            }
     return None
-
 
 def _parse_current_score(event: Dict) -> Optional[int]:
     """

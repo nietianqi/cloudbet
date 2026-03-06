@@ -111,7 +111,7 @@ def get_balance(cfg: Dict) -> float:
 
 # ── 下单 ──────────────────────────────────────────────────────
 
-def place_bet(cfg: Dict, signal: Dict) -> Dict:
+def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Dict:
     """
     向 Cloudbet 下单
 
@@ -119,7 +119,7 @@ def place_bet(cfg: Dict, signal: Dict) -> Dict:
         {success, reference_id, status, executed_price, reject_reason}
     """
     if cfg["DRY_RUN"]:
-        ref_id = f"DRY-{uuid.uuid4().hex[:8].upper()}"
+        ref_id = reference_id or f"DRY-{uuid.uuid4().hex[:8].upper()}"
         logger.info("[模拟] 下注 %.2f @ %.3f (%s)",
                     signal["stake"], signal["market_price"], signal["side"])
         return {
@@ -134,7 +134,7 @@ def place_bet(cfg: Dict, signal: Dict) -> Dict:
         "X-API-Key": cfg["API_KEY"],
         "Content-Type": "application/json",
     }
-    ref_id = str(uuid.uuid4())
+    ref_id = reference_id or str(uuid.uuid4())
     payload = {
         "referenceId": ref_id,
         "stake": str(round(signal["stake"], 2)),
@@ -288,8 +288,8 @@ def run(cfg: Dict) -> None:
 
     # 记录今日起始余额（用于日内亏损控制）
     start_balance = get_balance(cfg)
-    if start_balance <= 0 and not cfg["DRY_RUN"]:
-        logger.warning("无法获取账户余额，使用默认值 100")
+    if start_balance <= 0:
+        logger.warning("无法获取起始余额或余额为 0，使用默认值 100")
         start_balance = 100.0
     cfg["BANKROLL"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["CURRENCY"])
@@ -305,6 +305,9 @@ def run(cfg: Dict) -> None:
         balance = get_balance(cfg)
         if balance > 0:
             cfg["BANKROLL"] = balance
+        else:
+            # API 读取失败或返回 0 时，沿用上次有效余额，避免误触发亏损熔断
+            balance = cfg.get("BANKROLL", start_balance)
 
         # 风控检查
         stop_reason = check_risk_limits(cfg, balance, start_balance)
@@ -393,7 +396,7 @@ def run(cfg: Dict) -> None:
             )
 
             # 执行下单
-            result = place_bet(cfg, {**signal, "_ref_id": ref_id})
+            result = place_bet(cfg, signal, reference_id=ref_id)
             actual_ref_id = result["reference_id"]
 
             if result["success"]:
@@ -458,9 +461,12 @@ def main():
     if args.dry_run:
         cfg["DRY_RUN"] = True
         logger.info("模拟模式已启用")
-
-    if args.real:
+    elif args.play:
+        cfg["CURRENCY"] = "PLAY_EUR"
+        cfg["DRY_RUN"] = False
+    elif args.real:
         cfg["CURRENCY"] = "USDT"
+        cfg["DRY_RUN"] = False
 
     if args.edge is not None:
         cfg["EDGE_THRESHOLD"] = args.edge

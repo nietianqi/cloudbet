@@ -278,7 +278,7 @@ def run(cfg: Dict) -> None:
     logger.info("=" * 70)
 
     live_db.init_db(cfg["db_file"])
-    client = CloudbetClient(cfg["api_key"])
+    client = CloudbetClient(cfg.get("api_key", ""))
 
     # 获取起始余额
     try:
@@ -288,6 +288,7 @@ def run(cfg: Dict) -> None:
         logger.warning("无法获取余额，使用默认值 %.2f", start_balance)
 
     if start_balance <= 0:
+        logger.warning("起始余额不可用，使用默认值 100")
         start_balance = 100.0
 
     cfg["bankroll"] = start_balance
@@ -304,6 +305,9 @@ def run(cfg: Dict) -> None:
             balance = client.get_balance(cfg["currency"])
             if balance > 0:
                 cfg["bankroll"] = balance
+            else:
+                # API 返回 0 时沿用上次有效余额，避免误触发亏损熔断
+                balance = cfg.get("bankroll", start_balance)
         except Exception:
             balance = cfg.get("bankroll", start_balance)
 
