@@ -18,6 +18,7 @@
 """
 
 import argparse
+import json
 import logging
 import os
 import statistics
@@ -56,7 +57,7 @@ SOCCER_CONFIG = {
     # ── 仓位 ─────────────────────────────────────────────────
     "kelly_fraction": 0.20,             # 基础 1/5 Kelly
     "kelly_fraction_floor": 0.05,       # 动态收缩下限
-    "max_stake_pct": 0.005,             # 单注最大 0.5% 资金
+    "max_stake_pct": 0.01,              # 单注最大 1.0% 资金（避免低余额时小于最小注额）
     "min_stake": 1.0,                   # 最小注额（USDT）
     "edge_confidence_cap": 0.18,        # edge >= 18% 视为满信心
     "edge_confidence_floor": 0.35,      # 低 edge 时最小下注缩放
@@ -82,6 +83,8 @@ SOCCER_CONFIG = {
     "sleep_interval": 20,               # 轮询间隔（秒）；足球建议 15-30s
     "accept_price_change": "BETTER",    # NONE/BETTER/ALL
     "max_bets_per_event": 1,            # 每赛事最多下注 1 次
+    "max_rejects_per_event": 2,        # 同一赛事连续拒单上限（达到后冷却）
+    "event_reject_cooldown_secs": 90,  # 同一赛事拒单冷却时间
     "settle_batch_size": 40,           # ?????? 40 ????????
     "settle_min_stake": 0.01,          # ??? stake>0 ?????
     "auto_close_zero_stake_orders": True,  # ?????? 0 ????
@@ -101,6 +104,8 @@ SOCCER_CONFIG = {
 
 # Session 级别状态
 _bet_events: set = set()
+_event_rejects: Dict[str, int] = {}
+_event_retry_after: Dict[str, float] = {}
 _consec_rejects: int = 0
 _consec_losses: int = 0
 
@@ -248,10 +253,10 @@ def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_bud
     dyn_kelly = float(profile.get("kelly_fraction", base_kelly))
     kelly_mult = dyn_kelly / base_kelly
 
-    stake = base_stake * kelly_mult * edge_mult
-    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("max_stake_pct", 0.005))
+    stake_raw = base_stake * kelly_mult * edge_mult
+    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("max_stake_pct", 0.01))
     market_cap = float(signal.get("max_stake", bankroll_cap) or bankroll_cap)
-    stake = min(stake, bankroll_cap, market_cap)
+    stake = min(stake_raw, bankroll_cap, market_cap)
 
     remaining_round_budget = max(0.0, float(profile.get("available_round_budget", 0.0)) - used_round_budget)
     stake = min(stake, remaining_round_budget)
@@ -261,14 +266,42 @@ def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_bud
         float(signal.get("min_stake", cfg.get("min_stake", 1.0)) or cfg.get("min_stake", 1.0)),
     )
 
+    can_floor_to_min = (
+        min_required <= bankroll_cap
+        and min_required <= market_cap
+        and min_required <= remaining_round_budget
+    )
+
     if stake < min_required:
+        if can_floor_to_min:
+            final_stake = round(min_required, 2)
+            return final_stake, {
+                "reason": "floored_to_min_stake",
+                "stake_base": round(base_stake, 4),
+                "stake_raw": round(stake_raw, 4),
+                "stake_after_caps": round(stake, 4),
+                "min_required": min_required,
+                "bankroll_cap": round(bankroll_cap, 4),
+                "market_cap": round(market_cap, 4),
+                "remaining_round_budget": round(remaining_round_budget, 4),
+                "edge_mult": round(edge_mult, 4),
+                "kelly_mult": round(kelly_mult, 4),
+            }
+
         return 0.0, {
             "reason": "below_min_stake_or_budget",
-            "stake_raw": round(stake, 4),
+            "stake_base": round(base_stake, 4),
+            "stake_raw": round(stake_raw, 4),
+            "stake_after_caps": round(stake, 4),
             "min_required": min_required,
+            "bankroll_cap": round(bankroll_cap, 4),
+            "market_cap": round(market_cap, 4),
+            "remaining_round_budget": round(remaining_round_budget, 4),
             "edge_mult": round(edge_mult, 4),
             "kelly_mult": round(kelly_mult, 4),
         }
+
+
 
     final_stake = round(stake, 2)
     return final_stake, {
@@ -279,6 +312,26 @@ def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_bud
         "used_budget_after": round(used_round_budget + final_stake, 2),
         "round_budget": round(float(profile.get("available_round_budget", 0.0)), 2),
     }
+
+
+def _extract_reject_reason(result: Dict) -> str:
+    """统一提取拒单原因，避免 API 字段变化导致空原因。"""
+    for key in ("error", "errorCode", "rejectionReason", "reason", "message", "description", "statusMessage"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (dict, list)) and value:
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return str(value)
+
+    status = str(result.get("status") or "UNKNOWN")
+    try:
+        compact = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        compact = str(result)
+    return f"status={status}; raw={compact[:400]}"
 
 
 # ── 下单执行 ──────────────────────────────────────────────────
@@ -315,8 +368,9 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             "reference_id": db_ref_id,
             "status": "SKIPPED",
             "executed_price": None,
-            "reject_reason": "????",
+            "reject_reason": f"stake_below_min({stake:.2f} < {min_stake:.2f})",
         }
+
 
     current_price = signal["market_price"]
 
@@ -371,15 +425,17 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
     except (ValueError, TypeError):
         executed_price = current_price
 
-    error = result.get("error", result.get("errorCode", ""))
+    reject_reason = "" if status == "ACCEPTED" else _extract_reject_reason(result)
     return {
         "success": status == "ACCEPTED",
         "reference_id": actual_api_ref,
         "db_ref_id": db_ref_id,
         "status": status,
         "executed_price": executed_price,
-        "reject_reason": error,
+        "reject_reason": reject_reason,
+        "raw_result": result,
     }
+
 
 
 # ── 结算查询 ──────────────────────────────────────────────────
@@ -579,13 +635,18 @@ def run(cfg: Dict) -> None:
             if event_id in _bet_events:
                 continue
 
+            retry_after = float(_event_retry_after.get(event_id, 0.0) or 0.0)
+            now_ts = time.time()
+            if retry_after > now_ts:
+                continue
+
             if used_round_budget >= profile["available_round_budget"]:
                 logger.info("本轮资金预算已用尽，停止本轮下单")
                 break
 
             final_stake, stake_meta = size_stake_scientific(cfg, signal, profile, used_round_budget)
             if final_stake <= 0:
-                logger.debug("[%s] 资金管理跳过: %s", signal.get("match", event_id), stake_meta)
+                logger.info("[%s] 资金管理跳过: %s", signal.get("match", event_id), stake_meta)
                 continue
 
             signal["stake"] = final_stake
@@ -664,6 +725,8 @@ def run(cfg: Dict) -> None:
                     db_file=cfg["db_file"],
                 )
                 _bet_events.add(event_id)
+                _event_rejects.pop(event_id, None)
+                _event_retry_after.pop(event_id, None)
                 _consec_rejects = 0
                 logger.info(
                     "✅ 成交: %s | %s %.2f @ %.3f | db_ref=%s api_ref=%s",
@@ -675,19 +738,46 @@ def run(cfg: Dict) -> None:
                     result["reference_id"],
                 )
             else:
+                raw_status = str(result.get("status") or "UNKNOWN").upper()
+                order_status = "SKIPPED" if raw_status == "SKIPPED" else "REJECTED"
+
                 live_db.update_order_status(
                     pending_ref,
-                    "REJECTED",
+                    order_status,
                     reject_reason=result["reject_reason"],
                     db_file=cfg["db_file"],
                 )
-                _consec_rejects += 1
-                logger.warning(
-                    "❌ 拒单 #%d: %s | 原因=%s",
-                    _consec_rejects,
-                    signal["match"],
-                    result["reject_reason"],
-                )
+
+                if order_status == "REJECTED":
+                    _consec_rejects += 1
+                    event_rejects = _event_rejects.get(event_id, 0) + 1
+                    _event_rejects[event_id] = event_rejects
+
+                    max_rejects_per_event = int(cfg.get("max_rejects_per_event", 2))
+                    cooldown_secs = int(cfg.get("event_reject_cooldown_secs", 90))
+                    if event_rejects >= max_rejects_per_event:
+                        _event_retry_after[event_id] = time.time() + cooldown_secs
+                        logger.info(
+                            "[%s] 同一赛事拒单 %d 次，冷却 %d 秒",
+                            signal["match"],
+                            event_rejects,
+                            cooldown_secs,
+                        )
+
+                    logger.warning(
+                        "❌ 拒单 #%d: %s | status=%s | 原因=%s",
+                        _consec_rejects,
+                        signal["match"],
+                        raw_status,
+                        result["reject_reason"],
+                    )
+                else:
+                    logger.info(
+                        "⏭️ 跳过: %s | status=%s | 原因=%s",
+                        signal["match"],
+                        raw_status,
+                        result["reject_reason"],
+                    )
 
         logger.info("等待 %d 秒...", cfg["sleep_interval"])
         time.sleep(cfg["sleep_interval"])
@@ -766,3 +856,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
