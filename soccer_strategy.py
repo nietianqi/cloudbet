@@ -1,4 +1,4 @@
-"""
+﻿"""
 足球直播总进球信号生成模块
 =============================
 职责:
@@ -181,7 +181,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     pre_xg_away = cfg.get("pre_xg_away", _DEFAULT_PRE_XG_AWAY)
     live_weight = cfg.get("prior_weight_live", 0.65)
     db_file = cfg.get("db_file", "live_betting.db")
-    leagues = cfg.get("leagues", PRIORITY_LEAGUES)
+    # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
+    leagues = cfg.get("leagues")
 
     # 拉取所有直播赛事
     live_events = client.get_all_live_soccer(
@@ -365,3 +366,4 @@ def log_soccer_signal(signal: Dict) -> None:
         signal["market_price"],
         signal["stake"],
     )
+

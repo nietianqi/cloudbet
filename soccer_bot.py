@@ -1,4 +1,4 @@
-"""
+﻿"""
 足球直播总进球投注机器人 — 主程序
 =====================================
 策略: 足球 live total_goals 泊松定价 + +EV 入场
@@ -37,7 +37,9 @@ from soccer_strategy import generate_soccer_signals, log_soccer_signal
 # ── 配置 ─────────────────────────────────────────────────────
 SOCCER_CONFIG = {
     # ── API ──────────────────────────────────────────────────
-    "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
+    # "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
+    "api_key": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
+
     "af_key": os.environ.get("API_FOOTBALL_KEY", ""),   # 可选
     "currency": "PLAY_EUR",
     "dry_run": True,                    # 默认模拟模式
@@ -71,6 +73,7 @@ SOCCER_CONFIG = {
 
     # ── 数据 ─────────────────────────────────────────────────
     "db_file": "live_betting.db",
+    "leagues": None,                  # None=扫描全量足球联赛（非仅 PRIORITY_LEAGUES）
 }
 
 # Session 级别状态
@@ -500,3 +503,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
