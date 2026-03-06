@@ -1,4 +1,4 @@
-"""
+﻿"""
 NBA 直播总分投注机器人 — 主程序
 =================================
 策略: 篮球 live totals 贝叶斯定价 + 正期望值 (+EV) 入场
@@ -21,6 +21,7 @@ CLV 追踪:
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -63,12 +64,15 @@ NBA_CONFIG = {
     "DAILY_LOSS_LIMIT_PCT": 0.10,      # 日内最大亏损 10%
     "MAX_CONSEC_LOSSES": 5,            # 连续亏损熔断
     "MAX_CONSEC_REJECTS": 5,           # 连续拒单熔断
-    "MAX_REJECTION_RATE": 0.70,        # 近 100 笔拒单率上限
+    "MAX_REJECTION_RATE": 0.70,        # 近 N 笔终态单拒单率上限
+    "REJECTION_RATE_WINDOW": 100,      # rejection-rate window
+    "REJECTION_RATE_MIN_SAMPLES": 30,  # min samples for rejection-rate circuit breaker
     "MAX_CONCURRENT_EXPOSURE_PCT": 0.05, # 同时敞口最大 5%
 
     # ── 执行控制 ──────────────────────────────────────────────
     "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
+    "PENDING_ORDER_COOLDOWN_SECS": 60, # cooldown after pending response
     "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
     "DRY_RUN": False,                   # 默认模拟模式；命令行 --real 才切换为真实下单
     "LIVE_STATUSES": ["TRADING_LIVE"],
@@ -78,6 +82,7 @@ NBA_CONFIG = {
     "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE": True,
     "SETTLE_BATCH_SIZE": 40,
     "SETTLE_MIN_STAKE": 0.01,
+    "SETTLE_STATUSES": ["ACCEPTED", "PENDING"],
     "AUTO_CLOSE_ZERO_STAKE_ORDERS": True,
 
     # ── 数据库 ────────────────────────────────────────────────
@@ -86,6 +91,7 @@ NBA_CONFIG = {
 
 # 已下注赛事集合（session 内去重，防止对同一赛事多次下注）
 _bet_events: set = set()
+_event_retry_after: Dict[str, float] = {}
 
 # 连续拒单计数
 _consec_rejects: int = 0
@@ -120,14 +126,29 @@ def get_balance(cfg: Dict) -> float:
 
 
 # ── 下单 ──────────────────────────────────────────────────────
+def _extract_reject_reason(result: Dict) -> str:
+    for key in ("error", "errorCode", "rejectionReason", "reason", "message", "description", "statusMessage"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (dict, list)) and value:
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return str(value)
+
+    status = str(result.get("status") or "UNKNOWN")
+    try:
+        compact = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        compact = str(result)
+    return f"status={status}; raw={compact[:400]}"
+
+
+# ── 下单 ──────────────────────────────────────────────────────
 
 def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Dict:
-    """
-    向 Cloudbet 下单
-
-    返回:
-        {success, reference_id, status, executed_price, reject_reason}
-    """
+    """向 Cloudbet 下单。"""
     if cfg["DRY_RUN"]:
         ref_id = reference_id or f"DRY-{uuid.uuid4().hex[:8].upper()}"
         logger.info("[模拟] 下注 %.2f @ %.3f (%s)",
@@ -141,13 +162,14 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
         }
 
     stake = float(signal.get("stake") or 0.0)
-    if stake < float(cfg.get("MIN_STAKE", 1.0)):
+    min_stake = float(cfg.get("MIN_STAKE", 1.0))
+    if stake < min_stake:
         return {
             "success": False,
             "reference_id": reference_id or str(uuid.uuid4()),
             "status": "SKIPPED",
             "executed_price": None,
-            "reject_reason": "stake_below_min",
+            "reject_reason": f"stake_below_min({stake:.2f} < {min_stake:.2f})",
         }
 
     headers = {
@@ -168,11 +190,11 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
     try:
         resp = requests.post(cfg["BET_URL"], headers=headers, json=payload, timeout=15)
         data = resp.json()
-        status = data.get("status", "UNKNOWN")
+        status = str(data.get("status", "UNKNOWN")).upper()
         accepted = resp.status_code == 200 and status == "ACCEPTED"
 
         executed_price = data.get("price", signal["market_price"])
-        reject_reason = data.get("errorCode", data.get("message", "")) if not accepted else ""
+        reject_reason = "" if accepted else _extract_reject_reason(data)
 
         return {
             "success": accepted,
@@ -180,6 +202,7 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
             "status": status,
             "executed_price": float(executed_price) if executed_price else signal["market_price"],
             "reject_reason": reject_reason,
+            "raw_result": data,
         }
     except requests.RequestException as exc:
         return {
@@ -190,19 +213,10 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
             "reject_reason": str(exc),
         }
 
-
 # ── 风控检查 ──────────────────────────────────────────────────
 
 def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Optional[str]:
-    """
-    返回停机原因，None 表示可继续运行
-
-    检查项：
-      1. 日内亏损限制
-      2. 连续拒单
-      3. 整体拒单率
-      4. 连续亏损
-    """
+    """返回停机原因，None 表示可继续运行。"""
     global _consec_rejects, _consec_losses
 
     # 1. 日内亏损
@@ -215,22 +229,30 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
     if _consec_rejects >= cfg["MAX_CONSEC_REJECTS"]:
         return f"连续拒单 {_consec_rejects} 次，暂停执行"
 
-    # 3. 近 100 笔拒单率
-    rejection_rate = live_db.get_rejection_rate(100, cfg["DB_FILE"])
-    if rejection_rate > cfg["MAX_REJECTION_RATE"]:
-        return f"拒单率 {rejection_rate:.1%} > {cfg['MAX_REJECTION_RATE']:.0%}"
+    # 3. 近 N 笔终态单拒单率（按篮球维度）
+    rej_stats = live_db.get_rejection_stats(
+        window=int(cfg.get("REJECTION_RATE_WINDOW", 100)),
+        db_file=cfg["DB_FILE"],
+        sport="basketball",
+        include_statuses=["ACCEPTED", "REJECTED"],
+        rejected_statuses=["REJECTED"],
+    )
+    min_samples = int(cfg.get("REJECTION_RATE_MIN_SAMPLES", 30))
+    rejection_rate = float(rej_stats.get("rate", 0.0))
+    total_samples = int(rej_stats.get("total", 0))
+    if total_samples >= min_samples and rejection_rate > cfg["MAX_REJECTION_RATE"]:
+        return (
+            f"拒单率 {rejection_rate:.1%} > {cfg['MAX_REJECTION_RATE']:.0%} "
+            f"(样本 {total_samples}/{cfg.get('REJECTION_RATE_WINDOW', 100)})"
+        )
 
     # 4. 连续亏损
     if _consec_losses >= cfg["MAX_CONSEC_LOSSES"]:
         return f"连续亏损 {_consec_losses} 次，策略暂停复盘"
 
     return None
-
-
-# ── 结算 & CLV 更新（简易版）────────────────────────────────
-
 def try_settle_pending(cfg: Dict) -> None:
-    """?????????????????????????"""
+    """结算已接单和待受理订单，并同步最终状态。"""
     if cfg["DRY_RUN"]:
         return
 
@@ -239,14 +261,18 @@ def try_settle_pending(cfg: Dict) -> None:
     if cfg.get("AUTO_CLOSE_ZERO_STAKE_ORDERS", True):
         cleaned = live_db.auto_close_zero_stake_accepted_orders(db_file=db_file)
         if cleaned > 0:
-            logger.warning("??????? 0 ????: %d", cleaned)
+            logger.warning("自动关闭 0 注额 ACCEPTED 订单: %d", cleaned)
 
     settle_min_stake = float(cfg.get("SETTLE_MIN_STAKE", 0.01))
     settle_batch_size = max(1, int(cfg.get("SETTLE_BATCH_SIZE", 40)))
+    settle_statuses = [str(s).upper() for s in cfg.get("SETTLE_STATUSES", ["ACCEPTED", "PENDING"]) if str(s).strip()]
+    if not settle_statuses:
+        settle_statuses = ["ACCEPTED", "PENDING"]
 
     total_pending = live_db.count_unsettled_accepted_orders(
         db_file=db_file,
         min_stake=settle_min_stake,
+        statuses=settle_statuses,
     )
     if total_pending <= 0:
         return
@@ -255,14 +281,16 @@ def try_settle_pending(cfg: Dict) -> None:
         db_file=db_file,
         min_stake=settle_min_stake,
         limit=settle_batch_size,
+        statuses=settle_statuses,
     )
     if not pending:
         return
 
     logger.info(
-        "????: total=%d batch=%d min_stake=%.2f",
+        "结算扫描: total=%d batch=%d statuses=%s min_stake=%.2f",
         total_pending,
         len(pending),
+        ",".join(settle_statuses),
         settle_min_stake,
     )
 
@@ -279,6 +307,33 @@ def try_settle_pending(cfg: Dict) -> None:
                 continue
             data = resp.json()
             status = str(data.get("status", "")).upper()
+
+            if status in ("", "PENDING", "PENDING_ACCEPTANCE", "PENDING_PROCESSING"):
+                continue
+
+            if status == "ACCEPTED":
+                executed_price = data.get("price") or order.get("executed_price") or order.get("requested_price")
+                try:
+                    executed_price_val = float(executed_price) if executed_price is not None else None
+                except (ValueError, TypeError):
+                    executed_price_val = None
+                live_db.update_order_status(
+                    ref_id,
+                    "ACCEPTED",
+                    executed_price=executed_price_val,
+                    db_file=db_file,
+                )
+                continue
+
+            if status == "REJECTED":
+                live_db.update_order_status(
+                    ref_id,
+                    "REJECTED",
+                    reject_reason=_extract_reject_reason(data),
+                    db_file=db_file,
+                )
+                continue
+
             if status not in ("WIN", "LOSS", "LOSE", "PUSH", "SETTLED", "PARTIAL_WON", "PARTIAL_LOST", "VOID"):
                 continue
 
@@ -307,22 +362,20 @@ def try_settle_pending(cfg: Dict) -> None:
                 db_file=db_file,
             )
             settled_count += 1
-            logger.info("?????: %s | ??=%s | PnL=%+.2f", order.get("match", ref_id), status, pnl)
+            logger.info("结算: %s | outcome=%s | PnL=%+.2f", order.get("match", ref_id), status, pnl)
         except Exception as exc:
-            logger.debug("?????? %s: %s", ref_id, exc)
+            logger.debug("结算查询失败 %s: %s", ref_id, exc)
 
         if idx % 20 == 0 and idx < len(pending):
-            logger.info("????: %d/%d", idx, len(pending))
+            logger.info("结算进度: %d/%d", idx, len(pending))
 
     if total_pending > len(pending):
         logger.info(
-            "??????: ?? %d ???????????? %d ???? %d ?",
+            "结算剩余: 还有 %d 笔（本轮处理 %d，已结算 %d）",
             total_pending - len(pending),
             len(pending),
             settled_count,
         )
-
-
 
 def run(cfg: Dict) -> None:
     """主运行循环"""
@@ -339,6 +392,12 @@ def run(cfg: Dict) -> None:
 
     # 初始化数据库
     live_db.init_db(cfg["DB_FILE"])
+    try:
+        repaired = live_db.repair_pending_acceptance_rejections(cfg["DB_FILE"])
+        if repaired > 0:
+            logger.warning("修复历史误判订单: %d 条 REJECTED -> PENDING", repaired)
+    except Exception as exc:
+        logger.warning("修复历史误判订单失败: %s", exc)
 
     # 记录今日起始余额（用于日内亏损控制）
     start_balance = get_balance(cfg)
@@ -398,8 +457,13 @@ def run(cfg: Dict) -> None:
             event_id = signal["event_id"]
 
             # 去重
+            # 去重
             if event_id in _bet_events:
                 logger.debug("已下注赛事: %s", signal["match"])
+                continue
+
+            retry_after = float(_event_retry_after.get(event_id, 0.0) or 0.0)
+            if retry_after > time.time():
                 continue
 
             # 记录赔率快照
@@ -464,6 +528,7 @@ def run(cfg: Dict) -> None:
                     db_file=cfg["DB_FILE"],
                 )
                 _bet_events.add(event_id)
+                _event_retry_after.pop(event_id, None)
                 _consec_rejects = 0
                 logger.info(
                     "✅ 成交: %s | %s %.2f @ %.3f | ref=%s",
@@ -474,19 +539,47 @@ def run(cfg: Dict) -> None:
                     actual_ref_id,
                 )
             else:
+                raw_status = str(result.get("status") or "UNKNOWN").upper()
+                if raw_status.startswith("PENDING"):
+                    order_status = "PENDING"
+                elif raw_status in ("SKIPPED", "ERROR"):
+                    order_status = raw_status
+                else:
+                    order_status = "REJECTED"
+
                 live_db.update_order_status(
                     ref_id,
-                    "REJECTED",
+                    order_status,
                     reject_reason=result["reject_reason"],
                     db_file=cfg["DB_FILE"],
                 )
-                _consec_rejects += 1
-                logger.warning(
-                    "❌ 拒单: %s | 原因=%s | 连续拒单=%d",
-                    signal["match"],
-                    result["reject_reason"],
-                    _consec_rejects,
-                )
+
+                if order_status == "REJECTED":
+                    _consec_rejects += 1
+                    logger.warning(
+                        "❌ 拒单: %s | status=%s | 原因=%s | 连续拒单=%d",
+                        signal["match"],
+                        raw_status,
+                        result["reject_reason"],
+                        _consec_rejects,
+                    )
+                elif order_status == "PENDING":
+                    cooldown = int(cfg.get("PENDING_ORDER_COOLDOWN_SECS", 60))
+                    _event_retry_after[event_id] = time.time() + cooldown
+                    logger.info(
+                        "🕒 待受理: %s | status=%s | 冷却=%ds | 详情=%s",
+                        signal["match"],
+                        raw_status,
+                        cooldown,
+                        result["reject_reason"],
+                    )
+                else:
+                    logger.info(
+                        "⏭️ 跳过: %s | status=%s | 原因=%s",
+                        signal["match"],
+                        raw_status,
+                        result["reject_reason"],
+                    )
 
         logger.info("等待 %d 秒...", cfg["SLEEP_INTERVAL"])
         time.sleep(cfg["SLEEP_INTERVAL"])
@@ -566,3 +659,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

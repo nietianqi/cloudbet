@@ -1,4 +1,4 @@
-"""
+﻿"""
 SQLite 数据库管理 — 直播投注闭环日志
 ======================================
 四张核心表：
@@ -281,19 +281,25 @@ def get_accepted_orders(
     db_file: str = DB_FILE,
     min_stake: float = 0.0,
     limit: Optional[int] = None,
+    statuses: Optional[List[str]] = None,
 ) -> List[Dict]:
-    """????????????????? stake ??????"""
+    """Return unsettled orders with requested statuses and positive stake."""
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED"]
+
+    placeholders = ",".join("?" for _ in status_list)
     conn = get_connection(db_file)
-    sql = """
+    sql = f"""
         SELECT o.*
         FROM orders o
         LEFT JOIN results r ON o.reference_id = r.reference_id
-        WHERE o.status = 'ACCEPTED'
+        WHERE o.status IN ({placeholders})
           AND r.id IS NULL
           AND COALESCE(o.stake, 0) > ?
         ORDER BY o.id ASC
     """
-    params: List = [float(min_stake)]
+    params: List = status_list + [float(min_stake)]
     if limit is not None and int(limit) > 0:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -306,30 +312,35 @@ def get_accepted_orders(
 def count_unsettled_accepted_orders(
     db_file: str = DB_FILE,
     min_stake: float = 0.0,
+    statuses: Optional[List[str]] = None,
 ) -> int:
-    """?????????????"""
+    """Count unsettled orders with requested statuses and positive stake."""
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED"]
+
+    placeholders = ",".join("?" for _ in status_list)
     conn = get_connection(db_file)
-    row = conn.execute(
-        """
+    sql = f"""
         SELECT COUNT(*) AS cnt
         FROM orders o
         LEFT JOIN results r ON o.reference_id = r.reference_id
-        WHERE o.status = 'ACCEPTED'
+        WHERE o.status IN ({placeholders})
           AND r.id IS NULL
           AND COALESCE(o.stake, 0) > ?
-        """,
-        (float(min_stake),),
-    ).fetchone()
+    """
+    params: List = status_list + [float(min_stake)]
+    row = conn.execute(sql, tuple(params)).fetchone()
     conn.close()
     return int(row["cnt"] or 0) if row else 0
 
 
 def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:
     """
-    ????????????????????????????
+    Auto-close accepted orders that have zero stake and no settlement yet.
 
     Returns:
-        ???????????
+        Number of rows updated.
     """
     conn = get_connection(db_file)
     cur = conn.execute(
@@ -353,29 +364,101 @@ def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:
     return affected
 
 
-def get_rejection_rate(window: int = 100, db_file: str = DB_FILE) -> float:
+def repair_pending_acceptance_rejections(db_file: str = DB_FILE) -> int:
     """
-    计算最近 N 笔下注的拒单率（用于风险监控）
-
-    Cloudbet 条款：拒单率 > 80% 可能被标记
+    Recover historically misclassified orders:
+    status=REJECTED but reason indicates PENDING_ACCEPTANCE.
     """
     conn = get_connection(db_file)
-    row = conn.execute(
+    cur = conn.execute(
         """
+        UPDATE orders
+        SET status = 'PENDING'
+        WHERE id IN (
+            SELECT o.id
+            FROM orders o
+            LEFT JOIN results r ON o.reference_id = r.reference_id
+            WHERE o.status = 'REJECTED'
+              AND r.id IS NULL
+              AND UPPER(COALESCE(o.reject_reason, '')) LIKE '%PENDING_ACCEPTANCE%'
+        )
+        """
+    )
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
+
+
+def get_rejection_stats(
+    window: int = 100,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    include_statuses: Optional[List[str]] = None,
+    rejected_statuses: Optional[List[str]] = None,
+) -> Dict:
+    """Return rejection stats for recent orders after filtering."""
+    include = [str(s).upper() for s in (include_statuses or ["ACCEPTED", "REJECTED"]) if str(s).strip()]
+    rejected = [str(s).upper() for s in (rejected_statuses or ["REJECTED"]) if str(s).strip()]
+    if not include:
+        include = ["ACCEPTED", "REJECTED"]
+    if not rejected:
+        rejected = ["REJECTED"]
+
+    where_parts: List[str] = []
+    params: List = []
+    if sport:
+        where_parts.append("sport = ?")
+        params.append(str(sport).lower())
+
+    inc_ph = ",".join("?" for _ in include)
+    where_parts.append(f"status IN ({inc_ph})")
+    params.extend(include)
+
+    # Historical bug compatibility: do not treat pending-acceptance responses as true rejects.
+    where_parts.append("NOT (status = 'REJECTED' AND UPPER(COALESCE(reject_reason, '')) LIKE '%PENDING_ACCEPTANCE%')")
+
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    rej_ph = ",".join("?" for _ in rejected)
+
+    conn = get_connection(db_file)
+    sql = f"""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END) as rejected
+            SUM(CASE WHEN status IN ({rej_ph}) THEN 1 ELSE 0 END) as rejected
         FROM (
-            SELECT status FROM orders ORDER BY id DESC LIMIT ?
+            SELECT status
+            FROM orders
+            WHERE {where_clause}
+            ORDER BY id DESC
+            LIMIT ?
         )
-        """,
-        (window,),
-    ).fetchone()
+    """
+    row = conn.execute(sql, tuple(rejected + params + [int(window)])).fetchone()
     conn.close()
-    if row and row["total"] > 0:
-        return row["rejected"] / row["total"]
-    return 0.0
 
+    total = int(row["total"] or 0) if row else 0
+    rejected_cnt = int(row["rejected"] or 0) if row else 0
+    rate = (rejected_cnt / total) if total > 0 else 0.0
+    return {"total": total, "rejected": rejected_cnt, "rate": rate}
+
+
+def get_rejection_rate(
+    window: int = 100,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    include_statuses: Optional[List[str]] = None,
+    rejected_statuses: Optional[List[str]] = None,
+) -> float:
+    """Backward-compatible rejection-rate helper."""
+    stats = get_rejection_stats(
+        window=window,
+        db_file=db_file,
+        sport=sport,
+        include_statuses=include_statuses,
+        rejected_statuses=rejected_statuses,
+    )
+    return float(stats.get("rate", 0.0))
 
 # ── results ───────────────────────────────────────────────────
 
@@ -578,3 +661,4 @@ if __name__ == "__main__":
 
     os.remove(test_db)
     print("测试通过，测试文件已清理")
+
