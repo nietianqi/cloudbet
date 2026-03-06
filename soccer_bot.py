@@ -440,6 +440,16 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
         executed_price = current_price
 
     reject_reason = "" if status == "ACCEPTED" else _extract_reject_reason(result)
+
+    return {
+        "success": status == "ACCEPTED",
+        "reference_id": actual_api_ref,
+        "status": status,
+        "executed_price": executed_price,
+        "reject_reason": reject_reason,
+        "raw_result": result,
+    }
+
 def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
     """结算已接单和待受理订单，并同步最终状态。"""
     if cfg["dry_run"]:
@@ -915,6 +925,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
