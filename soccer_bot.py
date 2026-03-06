@@ -4,26 +4,23 @@
 策略: 足球 live total_goals 泊松定价 + +EV 入场
 
 运行方式:
-    python soccer_bot.py --dry-run             # 模拟模式（推荐先跑 1-2 周）
-    python soccer_bot.py --play                # PLAY_EUR 测试资金
-    python soccer_bot.py --real                # USDT 真实资金（须先验证 CLV > 0）
-    python soccer_bot.py --real --edge 0.07    # 提高 edge 阈值到 7%
+    python soccer_bot.py                      # 默认真实投注（USDT）
+    python soccer_bot.py --dry-run            # 模拟模式
+    python soccer_bot.py --play               # PLAY_EUR 测试资金
+    python soccer_bot.py --real               # USDT 真实资金（与默认一致）
+    python soccer_bot.py --real --edge 0.07   # 提高 edge 阈值到 7%
 
-风控熔断:
-    - 日内亏损 ≥ 10% → 停机
-    - 连续拒单 ≥ 5 次 → 暂停（Cloudbet 限制：最近 100 笔 >75% 拒单会被封号）
-    - 连续亏损 ≥ 6 次 → 暂停复盘
-    - 近 100 笔拒单率 > 70% → 告警并降频
-
-数据流:
-    Cloudbet Feed → 赔率快照 → 模型计算 → 信号过滤
-    → 下单(v3) → 状态更新 → 结算 → CLV 写库
-    → clv_report.py 分析（离线）
+资金管理:
+    - 动态分数 Kelly（基础 1/5 Kelly）
+    - 回撤约束（Drawdown-aware sizing）
+    - 波动率约束（Volatility targeting）
+    - 单轮风险预算 + 未结算在途敞口上限
 """
 
 import argparse
 import logging
 import os
+import statistics
 import sys
 import time
 import uuid
@@ -41,8 +38,8 @@ SOCCER_CONFIG = {
     "api_key": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
 
     "af_key": os.environ.get("API_FOOTBALL_KEY", ""),   # 可选
-    "currency": "PLAY_EUR",
-    "dry_run": True,                    # 默认模拟模式
+    "currency": "USDT",
+    "dry_run": False,                   # 默认真实投注
 
     # ── 信号阈值 ─────────────────────────────────────────────
     "edge_threshold": 0.06,             # 6% edge 才入场（足球 margin 比篮球高）
@@ -56,9 +53,23 @@ SOCCER_CONFIG = {
     "pre_xg_away": 1.15,                # 全联赛均值：客队预期进球
 
     # ── 仓位 ─────────────────────────────────────────────────
-    "kelly_fraction": 0.25,             # 1/4 Kelly
+    "kelly_fraction": 0.20,             # 基础 1/5 Kelly
+    "kelly_fraction_floor": 0.05,       # 动态收缩下限
     "max_stake_pct": 0.005,             # 单注最大 0.5% 资金
     "min_stake": 1.0,                   # 最小注额（USDT）
+    "edge_confidence_cap": 0.18,        # edge >= 18% 视为满信心
+    "edge_confidence_floor": 0.35,      # 低 edge 时最小下注缩放
+
+    # ── 资金管理（动态分数 Kelly）──────────────────────────
+    "drawdown_soft_pct": 0.08,          # 回撤 8% 开始降仓
+    "drawdown_hard_pct": 0.20,          # 回撤 20% 降到最小仓位
+    "drawdown_min_factor": 0.35,        # 回撤最小仓位系数
+    "vol_lookback": 80,                 # 波动率估计窗口（最近结算笔数）
+    "min_vol_samples": 20,              # 波动率估计最小样本
+    "target_return_vol": 0.018,         # 单笔目标收益率波动
+    "vol_factor_floor": 0.35,           # 高波动时最小缩放
+    "round_risk_budget_pct": 0.012,     # 单轮总下注预算上限（资金占比）
+    "max_open_exposure_pct": 0.03,      # 未结算在途风险上限（资金占比）
 
     # ── 风控 ─────────────────────────────────────────────────
     "daily_loss_limit_pct": 0.10,       # 日内最大亏损 10%
@@ -73,8 +84,13 @@ SOCCER_CONFIG = {
 
     # ── 数据 ─────────────────────────────────────────────────
     "db_file": "live_betting.db",
-    "leagues": None,                  # None=扫描全量足球联赛（非仅 PRIORITY_LEAGUES）
-    "live_statuses": ["TRADING_LIVE", "TRADING"],  # 允许状态（避免只看 TRADING_LIVE 漏数）
+    "leagues": None,                    # None=????????
+    "live_statuses": ["TRADING_LIVE", "TRADING"],
+    "scan_progress_every": 25,          # ??? N ??????????
+    "prefer_bulk_events_api": True,     # ??? /odds/events ????
+    "bulk_from_hours": 4,               # ??????? 4 ??
+    "bulk_to_hours": 2,                 # ??????? 2 ??
+
 }
 
 # Session 级别状态
@@ -123,6 +139,142 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
     return None
 
 
+# ── 资金管理 ──────────────────────────────────────────────────
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _drawdown_multiplier(cfg: Dict, drawdown: float) -> float:
+    soft = max(0.0, cfg.get("drawdown_soft_pct", 0.08))
+    hard = max(soft + 1e-6, cfg.get("drawdown_hard_pct", 0.20))
+    floor = _clamp(cfg.get("drawdown_min_factor", 0.35), 0.05, 1.0)
+
+    if drawdown <= soft:
+        return 1.0
+    if drawdown >= hard:
+        return floor
+
+    progress = (drawdown - soft) / (hard - soft)
+    return 1.0 - progress * (1.0 - floor)
+
+
+def compute_bankroll_profile(cfg: Dict, bankroll: float) -> Dict:
+    """
+    动态资金管理画像：回撤约束 + 波动率约束 + 风险预算。
+    """
+    peak = max(float(cfg.get("_peak_bankroll", bankroll) or bankroll), bankroll)
+    cfg["_peak_bankroll"] = peak
+    drawdown = 0.0 if peak <= 0 else max(0.0, (peak - bankroll) / peak)
+
+    dd_mult = _drawdown_multiplier(cfg, drawdown)
+
+    returns = live_db.get_recent_result_returns(
+        window=cfg.get("vol_lookback", 80),
+        db_file=cfg["db_file"],
+    )
+    min_samples = int(cfg.get("min_vol_samples", 20))
+    realized_vol = None
+    if len(returns) >= min_samples:
+        try:
+            realized_vol = float(statistics.pstdev(returns))
+        except statistics.StatisticsError:
+            realized_vol = None
+
+    vol_mult = 1.0
+    target_vol = max(float(cfg.get("target_return_vol", 0.018)), 1e-6)
+    if realized_vol and realized_vol > 1e-9:
+        vol_mult = _clamp(
+            target_vol / realized_vol,
+            float(cfg.get("vol_factor_floor", 0.35)),
+            1.0,
+        )
+
+    base_kelly = max(float(cfg.get("kelly_fraction", 0.2)), 1e-6)
+    dynamic_kelly = base_kelly * dd_mult * vol_mult
+    dynamic_kelly = _clamp(
+        dynamic_kelly,
+        float(cfg.get("kelly_fraction_floor", 0.05)),
+        base_kelly,
+    )
+
+    open_exposure = live_db.get_open_exposure(cfg["db_file"])
+    round_budget = bankroll * float(cfg.get("round_risk_budget_pct", 0.012))
+    open_limit = bankroll * float(cfg.get("max_open_exposure_pct", 0.03))
+    available_by_open = max(0.0, open_limit - open_exposure)
+    available_round_budget = max(0.0, min(round_budget, available_by_open))
+
+    return {
+        "bankroll": bankroll,
+        "peak": peak,
+        "drawdown": drawdown,
+        "drawdown_mult": dd_mult,
+        "realized_vol": realized_vol,
+        "vol_mult": vol_mult,
+        "base_kelly": base_kelly,
+        "kelly_fraction": dynamic_kelly,
+        "open_exposure": open_exposure,
+        "open_limit": open_limit,
+        "round_budget": round_budget,
+        "available_round_budget": available_round_budget,
+    }
+
+
+def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_budget: float) -> tuple:
+    """
+    基于动态分数 Kelly 计算本信号最终下注额。
+
+    返回:
+        (stake, meta)
+    """
+    base_stake = float(signal.get("stake") or 0.0)
+    if base_stake <= 0:
+        return 0.0, {"reason": "base_stake_non_positive"}
+
+    threshold = float(cfg.get("edge_threshold", 0.06))
+    edge_cap = max(float(cfg.get("edge_confidence_cap", 0.18)), threshold + 1e-6)
+    edge = float(signal.get("edge") or 0.0)
+    edge_norm = _clamp((edge - threshold) / (edge_cap - threshold), 0.0, 1.0)
+    edge_floor = _clamp(float(cfg.get("edge_confidence_floor", 0.35)), 0.05, 1.0)
+    edge_mult = edge_floor + (1.0 - edge_floor) * edge_norm
+
+    base_kelly = max(float(profile.get("base_kelly", cfg.get("kelly_fraction", 0.2))), 1e-6)
+    dyn_kelly = float(profile.get("kelly_fraction", base_kelly))
+    kelly_mult = dyn_kelly / base_kelly
+
+    stake = base_stake * kelly_mult * edge_mult
+    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("max_stake_pct", 0.005))
+    market_cap = float(signal.get("max_stake", bankroll_cap) or bankroll_cap)
+    stake = min(stake, bankroll_cap, market_cap)
+
+    remaining_round_budget = max(0.0, float(profile.get("available_round_budget", 0.0)) - used_round_budget)
+    stake = min(stake, remaining_round_budget)
+
+    min_required = max(
+        float(cfg.get("min_stake", 1.0)),
+        float(signal.get("min_stake", cfg.get("min_stake", 1.0)) or cfg.get("min_stake", 1.0)),
+    )
+
+    if stake < min_required:
+        return 0.0, {
+            "reason": "below_min_stake_or_budget",
+            "stake_raw": round(stake, 4),
+            "min_required": min_required,
+            "edge_mult": round(edge_mult, 4),
+            "kelly_mult": round(kelly_mult, 4),
+        }
+
+    final_stake = round(stake, 2)
+    return final_stake, {
+        "reason": "ok",
+        "edge_mult": round(edge_mult, 4),
+        "kelly_mult": round(kelly_mult, 4),
+        "dynamic_kelly": round(dyn_kelly, 4),
+        "used_budget_after": round(used_round_budget + final_stake, 2),
+        "round_budget": round(float(profile.get("available_round_budget", 0.0)), 2),
+    }
+
+
 # ── 下单执行 ──────────────────────────────────────────────────
 
 def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
@@ -168,12 +320,14 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
         # place_bet 使用 db_ref_id 作为 referenceId，保持 DB 与 API 一致
         price = get_fresh_price()
         if price <= 1.01:
-            return {"success": False, "reference_id": db_ref_id,
-                    "status": "SKIPPED", "executed_price": None,
-                    "reject_reason": "赔率无效"}
+            return {
+                "success": False,
+                "reference_id": db_ref_id,
+                "status": "SKIPPED",
+                "executed_price": None,
+                "reject_reason": "赔率无效",
+            }
 
-        # 传入 db_ref_id 作为 referenceId，确保 DB 与 Cloudbet API 使用同一个 UUID
-        global _consec_rejects
         result = client.place_bet(
             event_id=signal["event_id"],
             market_url=signal["market_url"],
@@ -183,12 +337,14 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             accept_price_change=cfg.get("accept_price_change", "BETTER"),
             reference_id=db_ref_id,
         )
-        actual_api_ref = result.get("_referenceId", db_ref_id)  # 应等于 db_ref_id
+        actual_api_ref = result.get("_referenceId", db_ref_id)
 
     except CloudbetAPIError as exc:
         return {
-            "success": False, "reference_id": db_ref_id,
-            "status": "ERROR", "executed_price": None,
+            "success": False,
+            "reference_id": db_ref_id,
+            "status": "ERROR",
+            "executed_price": None,
             "reject_reason": str(exc),
         }
 
@@ -197,12 +353,12 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
         executed_price = float(result.get("price") or current_price)
     except (ValueError, TypeError):
         executed_price = current_price
-    error = result.get("error", result.get("errorCode", ""))
 
+    error = result.get("error", result.get("errorCode", ""))
     return {
         "success": status == "ACCEPTED",
-        "reference_id": actual_api_ref,   # 用 API 实际 ref 查状态
-        "db_ref_id": db_ref_id,           # DB 主键
+        "reference_id": actual_api_ref,
+        "db_ref_id": db_ref_id,
         "status": status,
         "executed_price": executed_price,
         "reject_reason": error,
@@ -237,7 +393,7 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
             outcome = status
             if status == "WIN":
                 pnl = stake * (bet_price - 1.0)
-            elif status in ("LOSS",):
+            elif status == "LOSS":
                 pnl = -stake
                 outcome = "LOSE"
             elif status == "PARTIAL_WON":
@@ -258,10 +414,7 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
                 },
                 db_file=cfg["db_file"],
             )
-            logger.info(
-                "💰 结算: %s | 结果=%s | PnL=%+.2f",
-                order.get("match", ref_id), outcome, pnl
-            )
+            logger.info("💰 结算: %s | 结果=%s | PnL=%+.2f", order.get("match", ref_id), outcome, pnl)
         except Exception as exc:
             logger.debug("结算查询失败 %s: %s", ref_id, exc)
 
@@ -274,7 +427,7 @@ def run(cfg: Dict) -> None:
 
     logger.info("=" * 70)
     logger.info("  足球直播总进球机器人启动")
-    logger.info("  策略: 泊松定价 + +EV 入场 + 1/4 Kelly")
+    logger.info("  策略: 泊松定价 + +EV 入场 + 动态分数 Kelly")
     logger.info("  模式: %s", "模拟" if cfg["dry_run"] else "真实下单")
     logger.info("  货币: %s", cfg["currency"])
     logger.info("  Edge 阈值: %.0f%%", cfg["edge_threshold"] * 100)
@@ -287,22 +440,28 @@ def run(cfg: Dict) -> None:
     # 获取起始余额
     try:
         start_balance = client.get_balance(cfg["currency"])
-    except Exception:
-        start_balance = 100.0
-        logger.warning("无法获取余额，使用默认值 %.2f", start_balance)
+    except Exception as exc:
+        if cfg["dry_run"]:
+            start_balance = 100.0
+            logger.warning("无法获取余额，使用默认值 %.2f", start_balance)
+        else:
+            raise RuntimeError(f"真实模式无法获取账户余额: {exc}") from exc
 
     if start_balance <= 0:
-        logger.warning("起始余额不可用，使用默认值 100")
-        start_balance = 100.0
+        if cfg["dry_run"]:
+            logger.warning("起始余额不可用，使用默认值 100")
+            start_balance = 100.0
+        else:
+            raise RuntimeError("真实模式余额不可用或为 0，停止执行")
 
     cfg["bankroll"] = start_balance
+    cfg["_peak_bankroll"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["currency"])
 
     round_count = 0
     while True:
         round_count += 1
-        logger.info("\n%s — 第 %d 轮 (%s)", "─" * 50, round_count,
-                    datetime.now().strftime("%H:%M:%S"))
+        logger.info("\n%s — 第 %d 轮 (%s)", "─" * 50, round_count, datetime.now().strftime("%H:%M:%S"))
 
         # 更新余额
         try:
@@ -322,7 +481,6 @@ def run(cfg: Dict) -> None:
             wait_secs = cfg["sleep_interval"] * 4
             logger.info("暂停 %d 秒后重新检查...", wait_secs)
             time.sleep(wait_secs)
-            # 部分计数器自动恢复（人工复盘后重启程序重置）
             _consec_rejects = 0
             continue
 
@@ -344,13 +502,47 @@ def run(cfg: Dict) -> None:
 
         logger.info("发现 %d 个候选信号", len(signals))
 
+        profile = compute_bankroll_profile(cfg, balance)
+        logger.info(
+            "资金管理: bank=%.2f peak=%.2f dd=%.1f%% kelly=%.3f(基=%.3f) vol=%.3f open=%.2f/%.2f round_budget=%.2f",
+            profile["bankroll"],
+            profile["peak"],
+            profile["drawdown"] * 100,
+            profile["kelly_fraction"],
+            profile["base_kelly"],
+            profile["realized_vol"] if profile["realized_vol"] is not None else 0.0,
+            profile["open_exposure"],
+            profile["open_limit"],
+            profile["available_round_budget"],
+        )
+
+        used_round_budget = 0.0
         for signal in signals:
             event_id = signal["event_id"]
 
             if event_id in _bet_events:
                 continue
 
+            if used_round_budget >= profile["available_round_budget"]:
+                logger.info("本轮资金预算已用尽，停止本轮下单")
+                break
+
+            final_stake, stake_meta = size_stake_scientific(cfg, signal, profile, used_round_budget)
+            if final_stake <= 0:
+                logger.debug("[%s] 资金管理跳过: %s", signal.get("match", event_id), stake_meta)
+                continue
+
+            signal["stake"] = final_stake
+            used_round_budget += final_stake
+
             log_soccer_signal(signal)
+            logger.info(
+                "   资金管理: kelly_mult=%.3f edge_mult=%.3f budget=%.2f/%.2f",
+                stake_meta.get("kelly_mult", 0.0),
+                stake_meta.get("edge_mult", 0.0),
+                used_round_budget,
+                profile["available_round_budget"],
+            )
 
             # 写入赔率/模型快照
             try:
@@ -404,13 +596,14 @@ def run(cfg: Dict) -> None:
             except Exception as exc:
                 logger.debug("写 orders 失败: %s", exc)
 
-            # 执行下单（传入 pending_ref 确保 DB 与 API 记录一致）
+            # 执行下单
             result = execute_signal(client, cfg, signal, pending_ref)
 
             # 更新 DB 状态
             if result["success"]:
                 live_db.update_order_status(
-                    pending_ref, "ACCEPTED",
+                    pending_ref,
+                    "ACCEPTED",
                     executed_price=result["executed_price"],
                     db_file=cfg["db_file"],
                 )
@@ -427,14 +620,17 @@ def run(cfg: Dict) -> None:
                 )
             else:
                 live_db.update_order_status(
-                    pending_ref, "REJECTED",
+                    pending_ref,
+                    "REJECTED",
                     reject_reason=result["reject_reason"],
                     db_file=cfg["db_file"],
                 )
                 _consec_rejects += 1
                 logger.warning(
                     "❌ 拒单 #%d: %s | 原因=%s",
-                    _consec_rejects, signal["match"], result["reject_reason"]
+                    _consec_rejects,
+                    signal["match"],
+                    result["reject_reason"],
                 )
 
         logger.info("等待 %d 秒...", cfg["sleep_interval"])
@@ -445,7 +641,7 @@ def run(cfg: Dict) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="足球直播总进球投注机器人")
-    p.add_argument("--dry-run", action="store_true", help="模拟模式（默认）")
+    p.add_argument("--dry-run", action="store_true", help="模拟模式（覆盖默认真实投注）")
     p.add_argument("--play", action="store_true", help="使用 PLAY_EUR 测试资金")
     p.add_argument("--real", action="store_true", help="使用 USDT 真实资金")
     p.add_argument("--edge", type=float, default=None, help="Edge 阈值（如 0.07）")
@@ -460,16 +656,26 @@ def main():
     cfg = dict(SOCCER_CONFIG)
 
     # 命令行参数覆盖
-    if args.dry_run or (not args.real and not args.play):
+    if args.play and args.real:
+        logger.error("--play 与 --real 不能同时使用")
+        sys.exit(2)
+
+    if args.dry_run:
         cfg["dry_run"] = True
+        cfg["currency"] = "PLAY_EUR" if args.play else "USDT"
+    else:
+        if args.play:
+            cfg["currency"] = "PLAY_EUR"
+            cfg["dry_run"] = False
+        else:
+            # 默认真实投注（USDT）
+            cfg["currency"] = "USDT"
+            cfg["dry_run"] = False
 
     if args.real:
         cfg["currency"] = "USDT"
-        cfg["dry_run"] = False
-
-    if args.play:
-        cfg["currency"] = "PLAY_EUR"
-        cfg["dry_run"] = False
+        if not args.dry_run:
+            cfg["dry_run"] = False
 
     if args.edge is not None:
         cfg["edge_threshold"] = args.edge
@@ -504,4 +710,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -391,7 +391,59 @@ def get_recent_orders_count(minutes: int = 30, db_file: str = DB_FILE) -> int:
     return row["cnt"] if row else 0
 
 
-# ── 独立测试 ──────────────────────────────────────────────────
+# -- Risk Helpers ------------------------------------------------------------
+def get_recent_result_returns(window: int = 80, db_file: str = DB_FILE) -> List[float]:
+    """
+    Return recent settled bet returns as pnl / stake.
+    """
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        """
+        SELECT stake, pnl
+        FROM results
+        WHERE stake IS NOT NULL AND stake > 0
+          AND pnl IS NOT NULL
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (window,),
+    ).fetchall()
+    conn.close()
+
+    returns: List[float] = []
+    for row in rows:
+        try:
+            stake = float(row["stake"])
+            pnl = float(row["pnl"])
+        except (TypeError, ValueError):
+            continue
+        if stake > 0:
+            returns.append(pnl / stake)
+    return returns
+
+
+def get_open_exposure(db_file: str = DB_FILE) -> float:
+    """
+    Return total stake of accepted but unsettled orders.
+    """
+    conn = get_connection(db_file)
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(o.stake), 0) AS exposure
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE o.status = 'ACCEPTED'
+          AND r.id IS NULL
+        """
+    ).fetchone()
+    conn.close()
+    try:
+        return float(row["exposure"] or 0.0) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# -- Self Test ---------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     test_db = "test_live_betting.db"

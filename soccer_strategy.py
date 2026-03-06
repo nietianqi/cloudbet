@@ -184,12 +184,20 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
     leagues = cfg.get("leagues")
     live_statuses = cfg.get("live_statuses", ["TRADING_LIVE", "TRADING"])
+    scan_progress_every = cfg.get("scan_progress_every", 25)
+    prefer_bulk_events_api = cfg.get("prefer_bulk_events_api", True)
+    bulk_from_hours = cfg.get("bulk_from_hours", 4)
+    bulk_to_hours = cfg.get("bulk_to_hours", 2)
 
-    # 拉取所有足球在盘赛事（默认 TRADING_LIVE + TRADING）
+    # ????????????? TRADING_LIVE + TRADING?
     live_events = client.get_all_live_soccer(
         markets=["soccer.total_goals", "soccer.match_odds"],
         priority_leagues=leagues,
         live_statuses=live_statuses,
+        progress_every=scan_progress_every,
+        prefer_bulk_events_api=prefer_bulk_events_api,
+        bulk_from_hours=bulk_from_hours,
+        bulk_to_hours=bulk_to_hours,
     )
 
     if not live_events:
@@ -329,6 +337,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "model_prob": signal_info["model_prob"],
                 "mkt_prob": signal_info["mkt_prob"],
                 "fair_price": signal_info["fair_price"],
+                "max_stake": signal_info.get("max_stake", 9999),
+                "min_stake": signal_info.get("min_stake", min_stake),
                 "elapsed_minutes": elapsed,
                 "remaining_minutes": round(remaining_minutes, 1),
                 "goals_home": goals_home,

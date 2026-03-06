@@ -63,7 +63,55 @@ def test_extract_competition_keys_supports_categories_shape():
     assert keys == ["soccer-england-premier-league", "soccer-spain-la-liga"]
 
 
-def test_get_all_live_soccer_accepts_trading_and_live():
+def test_get_events_by_time_forwards_window_and_markets():
+    client = CloudbetClient("dummy")
+    client._get = MagicMock(return_value={"competitions": []})
+
+    client.get_events_by_time(
+        sport_key="soccer",
+        from_ts=100,
+        to_ts=200,
+        markets=["soccer.total_goals"],
+    )
+
+    client._get.assert_called_once_with(
+        "/pub/v2/odds/events",
+        params={
+            "sport": "soccer",
+            "from": 100,
+            "to": 200,
+            "markets": ["soccer.total_goals"],
+        },
+    )
+
+
+def test_get_all_live_soccer_bulk_api_accepts_trading_and_live():
+    client = CloudbetClient("dummy")
+    client.get_events_by_time = MagicMock(
+        return_value={
+            "competitions": [
+                {
+                    "key": "soccer-test-league",
+                    "name": "Test League",
+                    "events": [
+                        {"id": "1", "status": "TRADING_LIVE"},
+                        {"id": "2", "status": "TRADING"},
+                        {"id": "3", "status": "PRE_TRADING"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    events = client.get_all_live_soccer(markets=["soccer.total_goals"])
+
+    client.get_events_by_time.assert_called_once()
+    assert [e["id"] for e in events] == ["1", "2"]
+    assert events[0]["_competition_key"] == "soccer-test-league"
+    assert events[0]["_competition_name"] == "Test League"
+
+
+def test_get_all_live_soccer_legacy_league_scan_accepts_trading_and_live():
     client = CloudbetClient("dummy")
     client.get_competitions = MagicMock(return_value={"categories": []})
     client.extract_competition_keys = MagicMock(return_value=["soccer-test-league"])
@@ -78,7 +126,10 @@ def test_get_all_live_soccer_accepts_trading_and_live():
         }
     )
 
-    events = client.get_all_live_soccer(markets=["soccer.total_goals"])
+    events = client.get_all_live_soccer(
+        markets=["soccer.total_goals"],
+        prefer_bulk_events_api=False,
+    )
 
     client.get_events.assert_called_once_with(
         "soccer-test-league", ["soccer.total_goals"], status=None

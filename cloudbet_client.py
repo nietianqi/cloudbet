@@ -204,6 +204,29 @@ class CloudbetClient:
         """获取单个赛事的完整市场数据"""
         return self._get(f"/pub/v2/odds/events/{event_id}")
 
+    def get_events_by_time(
+        self,
+        sport_key: str = "soccer",
+        from_ts: Optional[int] = None,
+        to_ts: Optional[int] = None,
+        markets: List[str] = None,
+    ) -> dict:
+        """
+        Batch fetch events by unix timestamp window.
+
+        Notes:
+            - Cloudbet expects unix seconds for from/to.
+            - Useful to avoid N-competition sequential scan in live polling.
+        """
+        now_ts = int(time.time())
+        start_ts = int(from_ts) if from_ts is not None else now_ts - 4 * 3600
+        end_ts = int(to_ts) if to_ts is not None else now_ts + 2 * 3600
+
+        params: dict = {"sport": sport_key, "from": start_ts, "to": end_ts}
+        if markets:
+            params["markets"] = markets
+        return self._get("/pub/v2/odds/events", params=params)
+
     def get_live_events(
         self, competition_key: str, markets: List[str] = None
     ) -> List[dict]:
@@ -225,6 +248,10 @@ class CloudbetClient:
         markets: List[str] = None,
         priority_leagues: List[str] = None,
         live_statuses: Optional[List[str]] = None,
+        progress_every: int = 25,
+        prefer_bulk_events_api: bool = True,
+        bulk_from_hours: int = 4,
+        bulk_to_hours: int = 2,
     ) -> List[dict]:
         """
         Scan soccer competitions and return events matching requested statuses.
@@ -237,19 +264,90 @@ class CloudbetClient:
         Returns:
             List of event dicts with _competition_key/_competition_name fields.
         """
-        if priority_leagues is None:
-            comps = self.get_competitions("soccer")
-            priority_leagues = self.extract_competition_keys(comps)
-
         if live_statuses is None:
             live_statuses = ["TRADING_LIVE", "TRADING"]
         allowed_statuses = {str(s).upper() for s in live_statuses if s}
         api_status = "TRADING_LIVE" if allowed_statuses == {"TRADING_LIVE"} else None
 
+        if priority_leagues is None and prefer_bulk_events_api:
+            scan_start = time.time()
+            try:
+                now_ts = int(time.time())
+                from_ts = now_ts - int(bulk_from_hours * 3600)
+                to_ts = now_ts + int(bulk_to_hours * 3600)
+                payload = self.get_events_by_time(
+                    sport_key="soccer",
+                    from_ts=from_ts,
+                    to_ts=to_ts,
+                    markets=markets,
+                )
+                competitions = payload.get("competitions", []) or []
+                total_comps = len(competitions)
+                logger.info(
+                    "Soccer bulk scan started: competitions=%d window=-%dh/+%dh allowed=%s",
+                    total_comps,
+                    bulk_from_hours,
+                    bulk_to_hours,
+                    sorted(allowed_statuses) if allowed_statuses else "ALL",
+                )
+
+                live_events: List[dict] = []
+                status_counter: Counter = Counter()
+                scanned_events = 0
+
+                for idx, comp in enumerate(competitions, start=1):
+                    comp_key = comp.get("key") or ""
+                    comp_name = comp.get("name") or comp_key
+                    for event in comp.get("events", []) or []:
+                        status = str(event.get("status", "")).upper()
+                        scanned_events += 1
+                        if status:
+                            status_counter[status] += 1
+                        if allowed_statuses and status not in allowed_statuses:
+                            continue
+                        event["_competition_key"] = comp_key
+                        event["_competition_name"] = comp_name
+                        live_events.append(event)
+
+                    if progress_every and idx % progress_every == 0:
+                        logger.info(
+                            "Soccer bulk progress: %d/%d competitions events=%d matched=%d elapsed=%.1fs",
+                            idx,
+                            total_comps,
+                            scanned_events,
+                            len(live_events),
+                            time.time() - scan_start,
+                        )
+
+                logger.info(
+                    "Soccer bulk scan: competitions=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+                    total_comps,
+                    scanned_events,
+                    len(live_events),
+                    sorted(allowed_statuses) if allowed_statuses else "ALL",
+                    dict(status_counter),
+                    time.time() - scan_start,
+                )
+                return live_events
+            except CloudbetAPIError as exc:
+                logger.warning("Soccer bulk scan failed, fallback to league scan: %s", exc)
+
+        if priority_leagues is None:
+            comps = self.get_competitions("soccer")
+            priority_leagues = self.extract_competition_keys(comps)
+
+        total_leagues = len(priority_leagues)
+        scan_start = time.time()
+        logger.info(
+            "Soccer scan started: leagues=%d allowed=%s",
+            total_leagues,
+            sorted(allowed_statuses) if allowed_statuses else "ALL",
+        )
+
         live_events = []
         status_counter: Counter = Counter()
         scanned_events = 0
-        for comp_key in priority_leagues:
+        for idx, comp_key in enumerate(priority_leagues, start=1):
             if not comp_key:
                 continue
             try:
@@ -267,13 +365,24 @@ class CloudbetClient:
                     live_events.append(event)
             except CloudbetAPIError as exc:
                 logger.debug("Scan %s failed: %s", comp_key, exc)
+
+            if progress_every and idx % progress_every == 0:
+                logger.info(
+                    "Soccer scan progress: %d/%d leagues events=%d matched=%d elapsed=%.1fs",
+                    idx,
+                    total_leagues,
+                    scanned_events,
+                    len(live_events),
+                    time.time() - scan_start,
+                )
         logger.info(
-            "Soccer scan: leagues=%d events=%d matched=%d allowed=%s seen=%s",
-            len(priority_leagues),
+            "Soccer scan: leagues=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+            total_leagues,
             scanned_events,
             len(live_events),
             sorted(allowed_statuses) if allowed_statuses else "ALL",
             dict(status_counter),
+            time.time() - scan_start,
         )
         return live_events
 
