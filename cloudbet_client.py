@@ -21,6 +21,7 @@ Cloudbet API 客户端 — 完整 REST 封装
 import logging
 import time
 import uuid
+from collections import Counter
 from typing import Dict, List, Optional
 from urllib.parse import urlencode, parse_qs
 
@@ -133,6 +134,41 @@ class CloudbetClient:
         """获取某运动下的所有联赛（按分类分组）"""
         return self._get(f"/pub/v2/odds/sports/{sport_key}")
 
+
+    @staticmethod
+    def extract_competition_keys(sport_payload: dict) -> List[str]:
+        """
+        Extract competition keys from /pub/v2/odds/sports/{sport} response.
+
+        Supports both shapes:
+          1) categories[].competitions[].key
+          2) competitions[].key
+        """
+        keys: List[str] = []
+
+        for category in sport_payload.get("categories", []) or []:
+            for comp in category.get("competitions", []) or []:
+                key = comp.get("key")
+                name = (comp.get("name") or "").lower()
+                if key and not name.startswith("virtual"):
+                    keys.append(key)
+
+        if not keys:
+            for comp in sport_payload.get("competitions", []) or []:
+                key = comp.get("key")
+                name = (comp.get("name") or "").lower()
+                if key and not name.startswith("virtual"):
+                    keys.append(key)
+
+        dedup: List[str] = []
+        seen = set()
+        for k in keys:
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(k)
+        return dedup
+
     def get_events(
         self,
         competition_key: str,
@@ -188,37 +224,57 @@ class CloudbetClient:
         self,
         markets: List[str] = None,
         priority_leagues: List[str] = None,
+        live_statuses: Optional[List[str]] = None,
     ) -> List[dict]:
         """
-        扫描所有足球联赛，返回所有直播赛事
+        Scan soccer competitions and return events matching requested statuses.
 
-        参数:
-            markets        : 要拉取的市场
-            priority_leagues: 优先联赛键列表（None=全扫描，注意请求数量）
+        Args:
+            markets: Market keys to request.
+            priority_leagues: Competition keys to scan. None means full soccer scan.
+            live_statuses: Allowed statuses. Default ["TRADING_LIVE", "TRADING"].
 
-        返回:
-            list of event dicts (已附加 competition_key, competition_name 字段)
+        Returns:
+            List of event dicts with _competition_key/_competition_name fields.
         """
         if priority_leagues is None:
             comps = self.get_competitions("soccer")
-            priority_leagues = [
-                c.get("key", "") for c in comps.get("competitions", [])
-                if not c.get("name", "").lower().startswith("virtual")
-            ]
+            priority_leagues = self.extract_competition_keys(comps)
+
+        if live_statuses is None:
+            live_statuses = ["TRADING_LIVE", "TRADING"]
+        allowed_statuses = {str(s).upper() for s in live_statuses if s}
+        api_status = "TRADING_LIVE" if allowed_statuses == {"TRADING_LIVE"} else None
 
         live_events = []
+        status_counter: Counter = Counter()
+        scanned_events = 0
         for comp_key in priority_leagues:
             if not comp_key:
                 continue
             try:
-                data = self.get_events(comp_key, markets, status="TRADING_LIVE")
+                data = self.get_events(comp_key, markets, status=api_status)
+                comp_name = data.get("name", comp_key)
                 for event in data.get("events", []):
-                    if event.get("status") == "TRADING_LIVE":
-                        event["_competition_key"] = comp_key
-                        event["_competition_name"] = data.get("name", comp_key)
-                        live_events.append(event)
+                    status = str(event.get("status", "")).upper()
+                    scanned_events += 1
+                    if status:
+                        status_counter[status] += 1
+                    if allowed_statuses and status not in allowed_statuses:
+                        continue
+                    event["_competition_key"] = comp_key
+                    event["_competition_name"] = comp_name
+                    live_events.append(event)
             except CloudbetAPIError as exc:
-                logger.debug("扫描 %s 失败: %s", comp_key, exc)
+                logger.debug("Scan %s failed: %s", comp_key, exc)
+        logger.info(
+            "Soccer scan: leagues=%d events=%d matched=%d allowed=%s seen=%s",
+            len(priority_leagues),
+            scanned_events,
+            len(live_events),
+            sorted(allowed_statuses) if allowed_statuses else "ALL",
+            dict(status_counter),
+        )
         return live_events
 
     # ── Trading API v3 ────────────────────────────────────────
@@ -503,8 +559,8 @@ class CloudbetClient:
         elapsed = 0
 
         # 方式 1: scores 字段
-        scores = event.get("scores", {})
-        if scores:
+        scores = event.get("scores") or {}
+        if isinstance(scores, dict) and scores:
             try:
                 home_goals = int(scores.get("home") or scores.get("1") or 0)
                 away_goals = int(scores.get("away") or scores.get("2") or 0)
@@ -514,13 +570,15 @@ class CloudbetClient:
         # 方式 2: home/away score 子字段
         if home_goals == 0 and away_goals == 0:
             try:
-                home_goals = int(event.get("home", {}).get("score") or 0)
-                away_goals = int(event.get("away", {}).get("score") or 0)
+                home_obj = event.get("home") or {}
+                home_goals = int(home_obj.get("score") or 0)
+                away_obj = event.get("away") or {}
+                away_goals = int(away_obj.get("score") or 0)
             except (ValueError, TypeError):
                 pass
 
         # 方式 3: periods 累计
-        periods = event.get("periods", [])
+        periods = event.get("periods") or []
         if periods and home_goals == 0 and away_goals == 0:
             try:
                 for p in periods:
@@ -530,7 +588,7 @@ class CloudbetClient:
                 pass
 
         # 解析比赛时间
-        clock = event.get("clock", {})
+        clock = event.get("clock") or {}
         try:
             elapsed = int(clock.get("elapsedSeconds", 0)) // 60
         except (TypeError, ValueError):

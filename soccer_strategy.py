@@ -183,24 +183,36 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     db_file = cfg.get("db_file", "live_betting.db")
     # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
     leagues = cfg.get("leagues")
+    live_statuses = cfg.get("live_statuses", ["TRADING_LIVE", "TRADING"])
 
-    # 拉取所有直播赛事
+    # 拉取所有足球在盘赛事（默认 TRADING_LIVE + TRADING）
     live_events = client.get_all_live_soccer(
         markets=["soccer.total_goals", "soccer.match_odds"],
         priority_leagues=leagues,
+        live_statuses=live_statuses,
     )
 
     if not live_events:
-        logger.info("足球: 无直播赛事")
+        logger.info("足球: 无符合状态赛事（过滤=%s）", live_statuses)
         return []
+
+    status_count = defaultdict(int)
+    for event in live_events:
+        status_count[str(event.get("status", "UNKNOWN")).upper()] += 1
+    logger.info("足球: 获取赛事 %d 场，状态分布=%s", len(live_events), dict(status_count))
 
     model = InPlayGoalsModel(pre_xg_home, pre_xg_away, live_weight=live_weight)
     signals = []
 
     for event in live_events:
+        if not isinstance(event, dict):
+            continue
+
         event_id = str(event.get("id", ""))
-        home_name = event.get("home", {}).get("name", "?")
-        away_name = event.get("away", {}).get("name", "?")
+        home_obj = event.get("home") or {}
+        away_obj = event.get("away") or {}
+        home_name = home_obj.get("name", "?")
+        away_name = away_obj.get("name", "?")
         match_name = f"{home_name} vs {away_name}"
         comp_name = event.get("_competition_name", "")
 
@@ -227,7 +239,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                     "competition": comp_name,
                     "home_team": home_name,
                     "away_team": away_name,
-                    "status": "TRADING_LIVE",
+                    "status": str(event.get("status", "UNKNOWN")).upper(),
                     "market_url": market.get("over_url", ""),
                     "line": line,
                     "over_price": over_price,
@@ -366,4 +378,3 @@ def log_soccer_signal(signal: Dict) -> None:
         signal["market_price"],
         signal["stake"],
     )
-

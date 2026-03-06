@@ -74,6 +74,7 @@ SOCCER_CONFIG = {
     # ── 数据 ─────────────────────────────────────────────────
     "db_file": "live_betting.db",
     "leagues": None,                  # None=扫描全量足球联赛（非仅 PRIORITY_LEAGUES）
+    "live_statuses": ["TRADING_LIVE", "TRADING"],  # 允许状态（避免只看 TRADING_LIVE 漏数）
 }
 
 # Session 级别状态

@@ -36,3 +36,53 @@ def test_get_live_events_requests_live_status_and_filters():
         "soccer-england-premier-league", ["soccer.total_goals"], status="TRADING_LIVE"
     )
     assert result == [{"status": "TRADING_LIVE", "id": "1"}]
+
+
+
+def test_extract_competition_keys_supports_categories_shape():
+    payload = {
+        "categories": [
+            {
+                "name": "England",
+                "competitions": [
+                    {"key": "soccer-england-premier-league", "name": "Premier League"},
+                    {"key": "soccer-virtual-123", "name": "Virtual Soccer"},
+                ],
+            },
+            {
+                "name": "Spain",
+                "competitions": [
+                    {"key": "soccer-spain-la-liga", "name": "La Liga"},
+                ],
+            },
+        ]
+    }
+
+    keys = CloudbetClient.extract_competition_keys(payload)
+
+    assert keys == ["soccer-england-premier-league", "soccer-spain-la-liga"]
+
+
+def test_get_all_live_soccer_accepts_trading_and_live():
+    client = CloudbetClient("dummy")
+    client.get_competitions = MagicMock(return_value={"categories": []})
+    client.extract_competition_keys = MagicMock(return_value=["soccer-test-league"])
+    client.get_events = MagicMock(
+        return_value={
+            "name": "Test League",
+            "events": [
+                {"id": "1", "status": "TRADING_LIVE"},
+                {"id": "2", "status": "TRADING"},
+                {"id": "3", "status": "PRE_TRADING"},
+            ],
+        }
+    )
+
+    events = client.get_all_live_soccer(markets=["soccer.total_goals"])
+
+    client.get_events.assert_called_once_with(
+        "soccer-test-league", ["soccer.total_goals"], status=None
+    )
+    assert [e["id"] for e in events] == ["1", "2"]
+    assert events[0]["_competition_key"] == "soccer-test-league"
+    assert events[0]["_competition_name"] == "Test League"
