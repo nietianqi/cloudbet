@@ -103,7 +103,10 @@ def test_get_all_live_soccer_bulk_api_accepts_trading_and_live():
         }
     )
 
-    events = client.get_all_live_soccer(markets=["soccer.total_goals"])
+    events = client.get_all_live_soccer(
+        markets=["soccer.total_goals"],
+        hydrate_live_events=False,
+    )
 
     client.get_events_by_time.assert_called_once()
     assert [e["id"] for e in events] == ["1", "2"]
@@ -137,3 +140,30 @@ def test_get_all_live_soccer_legacy_league_scan_accepts_trading_and_live():
     assert [e["id"] for e in events] == ["1", "2"]
     assert events[0]["_competition_key"] == "soccer-test-league"
     assert events[0]["_competition_name"] == "Test League"
+
+def test_get_all_live_soccer_bulk_hydrates_trading_live_event():
+    client = CloudbetClient("dummy")
+    client.get_events_by_time = MagicMock(
+        return_value={
+            "competitions": [
+                {
+                    "key": "soccer-test-league",
+                    "name": "Test League",
+                    "events": [
+                        {"id": "1", "status": "TRADING_LIVE", "markets": []},
+                        {"id": "2", "status": "TRADING", "markets": []},
+                    ],
+                }
+            ]
+        }
+    )
+    client.get_event = MagicMock(
+        return_value={"id": "1", "status": "TRADING_LIVE", "markets": [{"key": "soccer.total_goals"}]}
+    )
+
+    events = client.get_all_live_soccer(markets=["soccer.total_goals"])
+
+    client.get_event.assert_called_once_with("1")
+    assert [e["id"] for e in events] == ["1", "2"]
+    assert events[0]["_competition_key"] == "soccer-test-league"
+

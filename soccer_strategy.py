@@ -177,6 +177,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     kelly_fraction = cfg.get("kelly_fraction", 0.25)
     max_stake_pct = cfg.get("max_stake_pct", 0.005)
     min_stake = cfg.get("min_stake", 1.0)
+    min_elapsed_minutes = cfg.get("min_elapsed_minutes", 1.0)
     pre_xg_home = cfg.get("pre_xg_home", _DEFAULT_PRE_XG_HOME)
     pre_xg_away = cfg.get("pre_xg_away", _DEFAULT_PRE_XG_AWAY)
     live_weight = cfg.get("prior_weight_live", 0.65)
@@ -188,6 +189,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     prefer_bulk_events_api = cfg.get("prefer_bulk_events_api", True)
     bulk_from_hours = cfg.get("bulk_from_hours", 4)
     bulk_to_hours = cfg.get("bulk_to_hours", 2)
+    hydrate_live_events = cfg.get("hydrate_live_events", True)
+    fallback_to_league_scan_on_bulk_failure = cfg.get("fallback_to_league_scan_on_bulk_failure", False)
 
     # ????????????? TRADING_LIVE + TRADING?
     live_events = client.get_all_live_soccer(
@@ -198,6 +201,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         prefer_bulk_events_api=prefer_bulk_events_api,
         bulk_from_hours=bulk_from_hours,
         bulk_to_hours=bulk_to_hours,
+        hydrate_live_events=hydrate_live_events,
+        fallback_to_league_scan_on_bulk_failure=fallback_to_league_scan_on_bulk_failure,
     )
 
     if not live_events:
@@ -211,6 +216,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
 
     model = InPlayGoalsModel(pre_xg_home, pre_xg_away, live_weight=live_weight)
     signals = []
+    skipped_for_elapsed = 0
 
     for event in live_events:
         if not isinstance(event, dict):
@@ -240,6 +246,22 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         # 同时写入 odds_snapshot 表（供 CLV 回测）
         try:
             goals_home, goals_away, elapsed = CloudbetClient.extract_match_score(event)
+        except Exception as exc:
+            logger.debug("??????: %s", exc)
+            continue
+
+        # ?????????? TRADING ???elapsed ??????????
+        if elapsed < float(min_elapsed_minutes):
+            skipped_for_elapsed += 1
+            logger.debug(
+                "[%s] elapsed=%.1f < %.1f???",
+                match_name,
+                elapsed,
+                float(min_elapsed_minutes),
+            )
+            continue
+
+        try:
             live_db.insert_odds_snapshot(
                 {
                     "event_id": event_id,
@@ -258,9 +280,9 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 db_file=db_file,
             )
         except Exception as exc:
-            logger.debug("写 odds_snapshot 失败: %s", exc)
+            logger.debug("? odds_snapshot ??: %s", exc)
 
-        # ── 稳定性检查 ────────────────────────────────────
+        # ?? ????? ????????????????????????????????????
         stable, stable_reason = _is_odds_stable(event_id, stable_window, jump_threshold)
         if not stable:
             logger.debug("[%s] 盘口不稳定: %s，跳过", match_name, stable_reason)
@@ -352,6 +374,14 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         )
 
     # 按 edge 降序排列
+    if not signals and skipped_for_elapsed > 0 and not cfg.get("af_key"):
+        logger.warning(
+            "?? Feed ?????????/???elapsed<%.1f: %d/%d?????? API_FOOTBALL_KEY????????",
+            float(min_elapsed_minutes),
+            skipped_for_elapsed,
+            len(live_events),
+        )
+
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
         "足球扫描完成: %d 场直播 → %d 个候选信号", len(live_events), len(signals)

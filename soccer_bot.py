@@ -44,6 +44,7 @@ SOCCER_CONFIG = {
     # ── 信号阈值 ─────────────────────────────────────────────
     "edge_threshold": 0.06,             # 6% edge 才入场（足球 margin 比篮球高）
     "min_remaining_minutes": 8.0,       # 至少剩 8 分钟（避免末段暴力反弹）
+    "min_elapsed_minutes": 1.0,       # ?? 1 ??????????
     "stable_window_secs": 25,           # 稳定性检测窗口
     "jump_threshold": 0.10,             # 盘口跳动阈值
     "prior_weight_live": 0.65,          # 实时 xG 最大权重
@@ -81,15 +82,20 @@ SOCCER_CONFIG = {
     "sleep_interval": 20,               # 轮询间隔（秒）；足球建议 15-30s
     "accept_price_change": "BETTER",    # NONE/BETTER/ALL
     "max_bets_per_event": 1,            # 每赛事最多下注 1 次
+    "settle_batch_size": 40,           # ?????? 40 ????????
+    "settle_min_stake": 0.01,          # ??? stake>0 ?????
+    "auto_close_zero_stake_orders": True,  # ?????? 0 ????
 
     # ── 数据 ─────────────────────────────────────────────────
     "db_file": "live_betting.db",
     "leagues": None,                    # None=????????
-    "live_statuses": ["TRADING_LIVE", "TRADING"],
+    "live_statuses": ["TRADING_LIVE"],      # ???????????? TRADING
     "scan_progress_every": 25,          # ??? N ??????????
     "prefer_bulk_events_api": True,     # ??? /odds/events ????
     "bulk_from_hours": 4,               # ??????? 4 ??
     "bulk_to_hours": 2,                 # ??????? 2 ??
+    "hydrate_live_events": True,       # ????????????????/???
+    "fallback_to_league_scan_on_bulk_failure": False,  # ???????????
 
 }
 
@@ -301,6 +307,17 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             "reject_reason": "",
         }
 
+    stake = float(signal.get("stake") or 0.0)
+    min_stake = float(signal.get("min_stake") or cfg.get("min_stake", 1.0) or 1.0)
+    if stake < min_stake:
+        return {
+            "success": False,
+            "reference_id": db_ref_id,
+            "status": "SKIPPED",
+            "executed_price": None,
+            "reject_reason": "????",
+        }
+
     current_price = signal["market_price"]
 
     def get_fresh_price() -> float:
@@ -368,15 +385,44 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
 # ── 结算查询 ──────────────────────────────────────────────────
 
 def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
-    """查询并结算已成交但未记录结果的订单"""
+    """??????????????????"""
     if cfg["dry_run"]:
         return
 
-    pending = live_db.get_accepted_orders(cfg["db_file"])
+    db_file = cfg["db_file"]
+
+    if cfg.get("auto_close_zero_stake_orders", True):
+        cleaned = live_db.auto_close_zero_stake_accepted_orders(db_file=db_file)
+        if cleaned > 0:
+            logger.warning("????????????: %d", cleaned)
+
+    settle_min_stake = float(cfg.get("settle_min_stake", 0.01))
+    settle_batch_size = max(1, int(cfg.get("settle_batch_size", 40)))
+
+    total_pending = live_db.count_unsettled_accepted_orders(
+        db_file=db_file,
+        min_stake=settle_min_stake,
+    )
+    if total_pending <= 0:
+        return
+
+    pending = live_db.get_accepted_orders(
+        db_file=db_file,
+        min_stake=settle_min_stake,
+        limit=settle_batch_size,
+    )
     if not pending:
         return
 
-    for order in pending:
+    logger.info(
+        "????: total=%d batch=%d min_stake=%.2f",
+        total_pending,
+        len(pending),
+        settle_min_stake,
+    )
+
+    settled_count = 0
+    for idx, order in enumerate(pending, start=1):
         ref_id = order.get("reference_id", "")
         if not ref_id or ref_id.startswith("DRY-"):
             continue
@@ -412,14 +458,24 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
                     "outcome": outcome,
                     "pnl": round(pnl, 4),
                 },
-                db_file=cfg["db_file"],
+                db_file=db_file,
             )
-            logger.info("💰 结算: %s | 结果=%s | PnL=%+.2f", order.get("match", ref_id), outcome, pnl)
+            settled_count += 1
+            logger.info("?? ??: %s | ??=%s | PnL=%+.2f", order.get("match", ref_id), outcome, pnl)
         except Exception as exc:
-            logger.debug("结算查询失败 %s: %s", ref_id, exc)
+            logger.debug("?????? %s: %s", ref_id, exc)
 
+        if idx % 20 == 0 and idx < len(pending):
+            logger.info("????: %d/%d", idx, len(pending))
 
-# ── 主循环 ────────────────────────────────────────────────────
+    if total_pending > len(pending):
+        logger.info(
+            "??????: %d?????? %d???? %d?",
+            total_pending - len(pending),
+            len(pending),
+            settled_count,
+        )
+
 
 def run(cfg: Dict) -> None:
     """主运行循环"""

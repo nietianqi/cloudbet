@@ -252,6 +252,8 @@ class CloudbetClient:
         prefer_bulk_events_api: bool = True,
         bulk_from_hours: int = 4,
         bulk_to_hours: int = 2,
+        hydrate_live_events: bool = True,
+        fallback_to_league_scan_on_bulk_failure: bool = False,
     ) -> List[dict]:
         """
         Scan soccer competitions and return events matching requested statuses.
@@ -267,7 +269,7 @@ class CloudbetClient:
         if live_statuses is None:
             live_statuses = ["TRADING_LIVE", "TRADING"]
         allowed_statuses = {str(s).upper() for s in live_statuses if s}
-        api_status = "TRADING_LIVE" if allowed_statuses == {"TRADING_LIVE"} else None
+        api_status = None
 
         if priority_leagues is None and prefer_bulk_events_api:
             scan_start = time.time()
@@ -275,11 +277,14 @@ class CloudbetClient:
                 now_ts = int(time.time())
                 from_ts = now_ts - int(bulk_from_hours * 3600)
                 to_ts = now_ts + int(bulk_to_hours * 3600)
+                # Bulk list payload can be large; when hydrating live events anyway,
+                # skip markets here to reduce timeout risk.
+                bulk_markets = None if hydrate_live_events else markets
                 payload = self.get_events_by_time(
                     sport_key="soccer",
                     from_ts=from_ts,
                     to_ts=to_ts,
-                    markets=markets,
+                    markets=bulk_markets,
                 )
                 competitions = payload.get("competitions", []) or []
                 total_comps = len(competitions)
@@ -294,6 +299,7 @@ class CloudbetClient:
                 live_events: List[dict] = []
                 status_counter: Counter = Counter()
                 scanned_events = 0
+                hydrated_events = 0
 
                 for idx, comp in enumerate(competitions, start=1):
                     comp_key = comp.get("key") or ""
@@ -305,31 +311,49 @@ class CloudbetClient:
                             status_counter[status] += 1
                         if allowed_statuses and status not in allowed_statuses:
                             continue
-                        event["_competition_key"] = comp_key
-                        event["_competition_name"] = comp_name
-                        live_events.append(event)
+
+                        event_payload = event
+                        if hydrate_live_events and status == "TRADING_LIVE":
+                            event_id = event.get("id")
+                            if event_id is not None:
+                                try:
+                                    detail = self.get_event(str(event_id))
+                                    if isinstance(detail, dict) and detail:
+                                        event_payload = detail
+                                        hydrated_events += 1
+                                except CloudbetAPIError as exc:
+                                    logger.debug("Hydrate event %s failed: %s", event_id, exc)
+
+                        event_payload["_competition_key"] = comp_key
+                        event_payload["_competition_name"] = comp_name
+                        live_events.append(event_payload)
 
                     if progress_every and idx % progress_every == 0:
                         logger.info(
-                            "Soccer bulk progress: %d/%d competitions events=%d matched=%d elapsed=%.1fs",
+                            "Soccer bulk progress: %d/%d competitions events=%d matched=%d hydrated=%d elapsed=%.1fs",
                             idx,
                             total_comps,
                             scanned_events,
                             len(live_events),
+                            hydrated_events,
                             time.time() - scan_start,
                         )
 
                 logger.info(
-                    "Soccer bulk scan: competitions=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+                    "Soccer bulk scan: competitions=%d events=%d matched=%d hydrated=%d allowed=%s seen=%s elapsed=%.1fs",
                     total_comps,
                     scanned_events,
                     len(live_events),
+                    hydrated_events,
                     sorted(allowed_statuses) if allowed_statuses else "ALL",
                     dict(status_counter),
                     time.time() - scan_start,
                 )
                 return live_events
             except CloudbetAPIError as exc:
+                if not fallback_to_league_scan_on_bulk_failure:
+                    logger.warning("Soccer bulk scan failed, skip this round: %s", exc)
+                    return []
                 logger.warning("Soccer bulk scan failed, fallback to league scan: %s", exc)
 
         if priority_leagues is None:

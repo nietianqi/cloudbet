@@ -277,18 +277,80 @@ def update_order_status(
     conn.close()
 
 
-def get_accepted_orders(db_file: str = DB_FILE) -> List[Dict]:
-    """返回所有已成交但尚未结算的订单"""
+def get_accepted_orders(
+    db_file: str = DB_FILE,
+    min_stake: float = 0.0,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """????????????????? stake ??????"""
     conn = get_connection(db_file)
-    rows = conn.execute(
-        """
-        SELECT o.* FROM orders o
+    sql = """
+        SELECT o.*
+        FROM orders o
         LEFT JOIN results r ON o.reference_id = r.reference_id
-        WHERE o.status = 'ACCEPTED' AND r.id IS NULL
-        """
-    ).fetchall()
+        WHERE o.status = 'ACCEPTED'
+          AND r.id IS NULL
+          AND COALESCE(o.stake, 0) > ?
+        ORDER BY o.id ASC
+    """
+    params: List = [float(min_stake)]
+    if limit is not None and int(limit) > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def count_unsettled_accepted_orders(
+    db_file: str = DB_FILE,
+    min_stake: float = 0.0,
+) -> int:
+    """?????????????"""
+    conn = get_connection(db_file)
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE o.status = 'ACCEPTED'
+          AND r.id IS NULL
+          AND COALESCE(o.stake, 0) > ?
+        """,
+        (float(min_stake),),
+    ).fetchone()
+    conn.close()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:
+    """
+    ????????????????????????????
+
+    Returns:
+        ???????????
+    """
+    conn = get_connection(db_file)
+    cur = conn.execute(
+        """
+        UPDATE orders
+        SET status = 'AUTO_VOID',
+            reject_reason = COALESCE(reject_reason, 'AUTO_CLOSED_ZERO_STAKE')
+        WHERE id IN (
+            SELECT o.id
+            FROM orders o
+            LEFT JOIN results r ON o.reference_id = r.reference_id
+            WHERE o.status = 'ACCEPTED'
+              AND r.id IS NULL
+              AND COALESCE(o.stake, 0) <= 0
+        )
+        """
+    )
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
 
 
 def get_rejection_rate(window: int = 100, db_file: str = DB_FILE) -> float:
