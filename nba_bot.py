@@ -42,7 +42,7 @@ NBA_CONFIG = {
     # "API_KEY": os.environ.get("CLOUDBET_API_KEY", ""),
     "API_KEY":"eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
 
-    "CURRENCY": "PLAY_EUR",            # 测试资金币种；真实下注改为 USDT
+    "CURRENCY": "USDT",            # 测试资金币种；真实下注改为 USDT
     "BET_URL": "https://sports-api.cloudbet.com/pub/v3/bets/place",
     "ACCOUNT_URL": "https://sports-api.cloudbet.com/pub/v1/account/currencies",
     "BET_HISTORY_URL": "https://sports-api.cloudbet.com/pub/v4/bets/history",
@@ -70,7 +70,15 @@ NBA_CONFIG = {
     "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
     "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
-    "DRY_RUN": True,                   # 默认模拟模式；命令行 --real 才切换为真实下单
+    "DRY_RUN": False,                   # 默认模拟模式；命令行 --real 才切换为真实下单
+    "LIVE_STATUSES": ["TRADING_LIVE"],
+    "PREFER_BULK_EVENTS_API": True,
+    "BULK_FROM_HOURS": 4,
+    "BULK_TO_HOURS": 2,
+    "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE": True,
+    "SETTLE_BATCH_SIZE": 40,
+    "SETTLE_MIN_STAKE": 0.01,
+    "AUTO_CLOSE_ZERO_STAKE_ORDERS": True,
 
     # ── 数据库 ────────────────────────────────────────────────
     "DB_FILE": "live_betting.db",
@@ -130,6 +138,16 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
             "status": "ACCEPTED",
             "executed_price": signal["market_price"],
             "reject_reason": "",
+        }
+
+    stake = float(signal.get("stake") or 0.0)
+    if stake < float(cfg.get("MIN_STAKE", 1.0)):
+        return {
+            "success": False,
+            "reference_id": reference_id or str(uuid.uuid4()),
+            "status": "SKIPPED",
+            "executed_price": None,
+            "reject_reason": "stake_below_min",
         }
 
     headers = {
@@ -212,21 +230,47 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
 # ── 结算 & CLV 更新（简易版）────────────────────────────────
 
 def try_settle_pending(cfg: Dict) -> None:
-    """
-    尝试结算已成交但尚未记录结果的订单。
+    """?????????????????????????"""
+    if cfg["DRY_RUN"]:
+        return
 
-    完整实现需调用 GET /pub/v3/bets/{referenceId}/status 或
-    GET /pub/v4/bets/history 来获取结算状态。
-    此处实现基础框架，实际结算逻辑留给 clv_report.py 批量运行。
-    """
-    pending = live_db.get_accepted_orders(cfg["DB_FILE"])
+    db_file = cfg["DB_FILE"]
+
+    if cfg.get("AUTO_CLOSE_ZERO_STAKE_ORDERS", True):
+        cleaned = live_db.auto_close_zero_stake_accepted_orders(db_file=db_file)
+        if cleaned > 0:
+            logger.warning("??????? 0 ????: %d", cleaned)
+
+    settle_min_stake = float(cfg.get("SETTLE_MIN_STAKE", 0.01))
+    settle_batch_size = max(1, int(cfg.get("SETTLE_BATCH_SIZE", 40)))
+
+    total_pending = live_db.count_unsettled_accepted_orders(
+        db_file=db_file,
+        min_stake=settle_min_stake,
+    )
+    if total_pending <= 0:
+        return
+
+    pending = live_db.get_accepted_orders(
+        db_file=db_file,
+        min_stake=settle_min_stake,
+        limit=settle_batch_size,
+    )
     if not pending:
         return
 
+    logger.info(
+        "????: total=%d batch=%d min_stake=%.2f",
+        total_pending,
+        len(pending),
+        settle_min_stake,
+    )
+
     headers = {"X-API-Key": cfg["API_KEY"]}
-    for order in pending:
+    settled_count = 0
+    for idx, order in enumerate(pending, start=1):
         ref_id = order.get("reference_id")
-        if not ref_id or ref_id.startswith("DRY-"):
+        if not ref_id or str(ref_id).startswith("DRY-"):
             continue
         try:
             url = f"https://sports-api.cloudbet.com/pub/v3/bets/{ref_id}/status"
@@ -234,43 +278,51 @@ def try_settle_pending(cfg: Dict) -> None:
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            status = data.get("status", "").upper()
-            if status in ("WIN", "LOSS", "LOSE", "PUSH", "SETTLED",
-                          "PARTIAL_WON", "PARTIAL_LOST", "VOID"):
-                # 记录结果（CLV 由 clv_report.py 补录）
-                pnl = 0.0
-                stake = float(order.get("stake") or 0)
-                bet_price = float(order.get("executed_price") or order.get("requested_price") or 1.0)
-                returned = float(data.get("returnAmount") or 0)
-                if returned > 0:
-                    pnl = returned - stake
-                elif status == "WIN":
-                    pnl = stake * (bet_price - 1.0)
-                elif status in ("LOSS", "LOSE"):
-                    pnl = -stake
+            status = str(data.get("status", "")).upper()
+            if status not in ("WIN", "LOSS", "LOSE", "PUSH", "SETTLED", "PARTIAL_WON", "PARTIAL_LOST", "VOID"):
+                continue
 
-                live_db.insert_result(
-                    {
-                        "reference_id": ref_id,
-                        "event_id": order.get("event_id", ""),
-                        "match": order.get("match", ""),
-                        "side": order.get("side", ""),
-                        "stake": stake,
-                        "bet_price": bet_price,
-                        "outcome": status,
-                        "pnl": round(pnl, 4),
-                    },
-                    db_file=cfg["DB_FILE"],
-                )
-                logger.info(
-                    "💰 结算: %s | 结果=%s | PnL=%+.2f",
-                    order.get("match", ref_id), status, pnl
-                )
+            pnl = 0.0
+            stake = float(order.get("stake") or 0)
+            bet_price = float(order.get("executed_price") or order.get("requested_price") or 1.0)
+            returned = float(data.get("returnAmount") or 0)
+            if returned > 0:
+                pnl = returned - stake
+            elif status == "WIN":
+                pnl = stake * (bet_price - 1.0)
+            elif status in ("LOSS", "LOSE"):
+                pnl = -stake
+
+            live_db.insert_result(
+                {
+                    "reference_id": ref_id,
+                    "event_id": order.get("event_id", ""),
+                    "match": order.get("match", ""),
+                    "side": order.get("side", ""),
+                    "stake": stake,
+                    "bet_price": bet_price,
+                    "outcome": status,
+                    "pnl": round(pnl, 4),
+                },
+                db_file=db_file,
+            )
+            settled_count += 1
+            logger.info("?????: %s | ??=%s | PnL=%+.2f", order.get("match", ref_id), status, pnl)
         except Exception as exc:
-            logger.debug("结算查询失败 %s: %s", ref_id, exc)
+            logger.debug("?????? %s: %s", ref_id, exc)
+
+        if idx % 20 == 0 and idx < len(pending):
+            logger.info("????: %d/%d", idx, len(pending))
+
+    if total_pending > len(pending):
+        logger.info(
+            "??????: ?? %d ???????????? %d ???? %d ?",
+            total_pending - len(pending),
+            len(pending),
+            settled_count,
+        )
 
 
-# ── 主循环 ────────────────────────────────────────────────────
 
 def run(cfg: Dict) -> None:
     """主运行循环"""
@@ -291,8 +343,11 @@ def run(cfg: Dict) -> None:
     # 记录今日起始余额（用于日内亏损控制）
     start_balance = get_balance(cfg)
     if start_balance <= 0:
-        logger.warning("无法获取起始余额或余额为 0，使用默认值 100")
-        start_balance = 100.0
+        if cfg["DRY_RUN"]:
+            logger.warning("????????? 0?????????? 100")
+            start_balance = 100.0
+        else:
+            raise RuntimeError("??????????? 0?????")
     cfg["BANKROLL"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["CURRENCY"])
 
@@ -460,15 +515,26 @@ def main():
     args = parse_args()
     cfg = dict(NBA_CONFIG)
 
+    if args.play and args.real:
+        logger.error("--play ? --real ??????")
+        sys.exit(2)
+
     if args.dry_run:
         cfg["DRY_RUN"] = True
-        logger.info("模拟模式已启用")
-    elif args.play:
-        cfg["CURRENCY"] = "PLAY_EUR"
-        cfg["DRY_RUN"] = False
-    elif args.real:
+        cfg["CURRENCY"] = "PLAY_EUR" if args.play else "USDT"
+    else:
+        if args.play:
+            cfg["CURRENCY"] = "PLAY_EUR"
+            cfg["DRY_RUN"] = False
+        else:
+            # ???????USDT?
+            cfg["CURRENCY"] = "USDT"
+            cfg["DRY_RUN"] = False
+
+    if args.real:
         cfg["CURRENCY"] = "USDT"
-        cfg["DRY_RUN"] = False
+        if not args.dry_run:
+            cfg["DRY_RUN"] = False
 
     if args.edge is not None:
         cfg["EDGE_THRESHOLD"] = args.edge
@@ -481,20 +547,20 @@ def main():
 
     if not cfg["API_KEY"]:
         logger.error(
-            "未设置 API Key！\n"
-            "方式一: 环境变量 export CLOUDBET_API_KEY=your_key\n"
-            "方式二: 命令行 python nba_bot.py --api-key your_key\n"
-            "方式三: 直接编辑 nba_bot.py 中的 NBA_CONFIG['API_KEY']"
+            "??? API Key?\n"
+            "???: ???? export CLOUDBET_API_KEY=your_key\n"
+            "???: ??? python nba_bot.py --api-key your_key\n"
+            "???: ???? nba_bot.py ?? NBA_CONFIG['API_KEY']"
         )
         sys.exit(1)
 
     try:
         run(cfg)
     except KeyboardInterrupt:
-        logger.info("\n用户中断，机器人退出")
+        logger.info("\n??????????")
         sys.exit(0)
     except Exception as exc:
-        logger.error("系统异常: %s", exc, exc_info=True)
+        logger.error("????: %s", exc, exc_info=True)
         sys.exit(1)
 
 

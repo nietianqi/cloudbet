@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from cloudbet_client import CloudbetClient
@@ -167,3 +168,28 @@ def test_get_all_live_soccer_bulk_hydrates_trading_live_event():
     assert [e["id"] for e in events] == ["1", "2"]
     assert events[0]["_competition_key"] == "soccer-test-league"
 
+
+
+def test_extract_match_score_reads_clock_elapsed_seconds():
+    event = {
+        "scores": {"home": 1, "away": 2},
+        "clock": {"elapsedSeconds": 1860},
+    }
+
+    home, away, elapsed = CloudbetClient.extract_match_score(event)
+
+    assert (home, away, elapsed) == (1, 2, 31)
+
+
+def test_extract_match_score_falls_back_to_cutoff_time():
+    kickoff = datetime.now(timezone.utc) - timedelta(minutes=12)
+    event = {
+        "scores": {"home": 0, "away": 0},
+        "cutoffTime": kickoff.isoformat().replace("+00:00", "Z"),
+    }
+
+    home, away, elapsed = CloudbetClient.extract_match_score(event)
+
+    assert home == 0
+    assert away == 0
+    assert 10 <= elapsed <= 14

@@ -21,6 +21,7 @@ Cloudbet API 客户端 — 完整 REST 封装
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from collections import Counter
 from typing import Dict, List, Optional
 from urllib.parse import urlencode, parse_qs
@@ -684,14 +685,14 @@ class CloudbetClient:
     @staticmethod
     def extract_match_score(event: dict) -> tuple:
         """
-        从事件数据中解析当前比分
+        ????????????
 
-        返回: (home_goals, away_goals, elapsed_minute)
+        ??: (home_goals, away_goals, elapsed_minute)
         """
         home_goals = away_goals = 0
         elapsed = 0
 
-        # 方式 1: scores 字段
+        # ?? 1: scores ??
         scores = event.get("scores") or {}
         if isinstance(scores, dict) and scores:
             try:
@@ -700,7 +701,7 @@ class CloudbetClient:
             except (ValueError, TypeError):
                 pass
 
-        # 方式 2: home/away score 子字段
+        # ?? 2: home/away score ???
         if home_goals == 0 and away_goals == 0:
             try:
                 home_obj = event.get("home") or {}
@@ -710,7 +711,7 @@ class CloudbetClient:
             except (ValueError, TypeError):
                 pass
 
-        # 方式 3: periods 累计
+        # ?? 3: periods ??
         periods = event.get("periods") or []
         if periods and home_goals == 0 and away_goals == 0:
             try:
@@ -720,12 +721,39 @@ class CloudbetClient:
             except (ValueError, TypeError):
                 pass
 
-        # 解析比赛时间
+        # ????????? clock??????? kickoff ??
         clock = event.get("clock") or {}
-        try:
-            elapsed = int(clock.get("elapsedSeconds", 0)) // 60
-        except (TypeError, ValueError):
-            pass
+        elapsed_candidates = (
+            clock.get("elapsedSeconds"),
+            clock.get("elapsed"),
+            event.get("elapsedSeconds"),
+            event.get("elapsed"),
+        )
+        for raw_elapsed in elapsed_candidates:
+            if raw_elapsed in (None, ""):
+                continue
+            try:
+                elapsed_secs = float(raw_elapsed)
+            except (TypeError, ValueError):
+                continue
+            if elapsed_secs > 0:
+                elapsed = int(elapsed_secs // 60)
+                break
+
+        if elapsed <= 0:
+            kickoff = event.get("cutoffTime") or event.get("startTime")
+            if kickoff:
+                try:
+                    kickoff_dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00"))
+                    if kickoff_dt.tzinfo is None:
+                        kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+                    now_dt = datetime.now(timezone.utc)
+                    elapsed = max(0, int((now_dt - kickoff_dt).total_seconds() // 60))
+                except (TypeError, ValueError):
+                    pass
+
+        # ?????/????????????
+        elapsed = max(0, min(elapsed, 130))
 
         return home_goals, away_goals, elapsed
 

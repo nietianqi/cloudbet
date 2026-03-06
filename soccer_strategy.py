@@ -189,8 +189,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     prefer_bulk_events_api = cfg.get("prefer_bulk_events_api", True)
     bulk_from_hours = cfg.get("bulk_from_hours", 4)
     bulk_to_hours = cfg.get("bulk_to_hours", 2)
-    hydrate_live_events = cfg.get("hydrate_live_events", True)
-    fallback_to_league_scan_on_bulk_failure = cfg.get("fallback_to_league_scan_on_bulk_failure", False)
+    hydrate_live_events = cfg.get("hydrate_live_events", False)
+    fallback_to_league_scan_on_bulk_failure = cfg.get("fallback_to_league_scan_on_bulk_failure", True)
 
     # ????????????? TRADING_LIVE + TRADING?
     live_events = client.get_all_live_soccer(

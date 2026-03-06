@@ -24,7 +24,7 @@ API 说明:
 
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -57,57 +57,163 @@ EVENTS_URL = "https://sports-api.cloudbet.com/pub/v2/odds/events"
 BET_HISTORY_URL = "https://sports-api.cloudbet.com/pub/v4/bets/history"
 
 
-def fetch_live_basketball_events(api_key: str) -> List[Dict]:
+def fetch_live_basketball_events(
+    api_key: str,
+    live_statuses: Optional[List[str]] = None,
+    bulk_from_hours: int = 4,
+    bulk_to_hours: int = 2,
+    prefer_bulk_events_api: bool = True,
+    fallback_to_league_scan_on_bulk_failure: bool = True,
+) -> List[Dict]:
     """
-    拉取所有 TRADING_LIVE 篮球赛事
-
-    说明：
-      直接请求 /pub/v2/odds/events 在部分参数组合下会触发 400。
-      这里改为“先拉 basketball competitions，再逐联赛拉 TRADING_LIVE”
-      的稳定路径，与 soccer 策略保持一致。
-
-    返回：competition list（原始 API 结构）
+    ??????????? bulk events??????????????
     """
     client = CloudbetClient(api_key)
-    competitions: List[Dict] = []
+
+    if live_statuses is None:
+        live_statuses = ["TRADING_LIVE"]
+    allowed_statuses = {str(s).upper() for s in live_statuses if s}
+
+    if prefer_bulk_events_api:
+        try:
+            now_ts = int(time.time())
+            payload = client.get_events_by_time(
+                sport_key="basketball",
+                from_ts=now_ts - int(bulk_from_hours * 3600),
+                to_ts=now_ts + int(bulk_to_hours * 3600),
+                markets=["basketball.totals"],
+            )
+            raw_comps = payload.get("competitions", []) or []
+            total_comps = len(raw_comps)
+            scanned_events = 0
+            matched_events = 0
+            status_counter: Counter = Counter()
+            competitions: List[Dict] = []
+            scan_start = time.time()
+
+            logger.info(
+                "Basketball bulk scan started: competitions=%d window=-%dh/+%dh allowed=%s",
+                total_comps,
+                bulk_from_hours,
+                bulk_to_hours,
+                sorted(allowed_statuses) if allowed_statuses else "ALL",
+            )
+
+            for idx, comp in enumerate(raw_comps, start=1):
+                comp_key = comp.get("key") or ""
+                comp_name = comp.get("name") or comp_key
+                kept: List[Dict] = []
+
+                for event in comp.get("events", []) or []:
+                    status = str(event.get("status", "")).upper()
+                    scanned_events += 1
+                    if status:
+                        status_counter[status] += 1
+                    if allowed_statuses and status not in allowed_statuses:
+                        continue
+                    event["_competition_key"] = comp_key
+                    event["_competition_name"] = comp_name
+                    kept.append(event)
+                    matched_events += 1
+
+                if kept:
+                    competitions.append({"key": comp_key, "name": comp_name, "events": kept})
+
+                if idx % 20 == 0:
+                    logger.info(
+                        "Basketball bulk progress: %d/%d competitions events=%d matched=%d elapsed=%.1fs",
+                        idx,
+                        total_comps,
+                        scanned_events,
+                        matched_events,
+                        time.time() - scan_start,
+                    )
+
+            logger.info(
+                "Basketball bulk scan: competitions=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+                total_comps,
+                scanned_events,
+                matched_events,
+                sorted(allowed_statuses) if allowed_statuses else "ALL",
+                dict(status_counter),
+                time.time() - scan_start,
+            )
+            return competitions
+        except CloudbetAPIError as exc:
+            if not fallback_to_league_scan_on_bulk_failure:
+                logger.warning("Basketball bulk scan failed, skip this round: %s", exc)
+                return []
+            logger.warning("Basketball bulk scan failed, fallback to league scan: %s", exc)
 
     try:
         comp_resp = client.get_competitions("basketball")
     except CloudbetAPIError as exc:
-        logger.warning("拉取篮球联赛失败: %s", exc)
+        logger.warning("????????: %s", exc)
         return []
 
-    comp_keys = [
-        c.get("key", "")
-        for c in comp_resp.get("competitions", [])
-        if c.get("key") and "virtual" not in c.get("name", "").lower()
-    ]
+    comp_keys = CloudbetClient.extract_competition_keys(comp_resp)
+    total_leagues = len(comp_keys)
+    scanned_events = 0
+    matched_events = 0
+    status_counter: Counter = Counter()
+    competitions: List[Dict] = []
+    scan_start = time.time()
 
-    for comp_key in comp_keys:
+    logger.info(
+        "Basketball league scan started: leagues=%d allowed=%s",
+        total_leagues,
+        sorted(allowed_statuses) if allowed_statuses else "ALL",
+    )
+
+    for idx, comp_key in enumerate(comp_keys, start=1):
         try:
-            data = client.get_events(
-                comp_key,
-                markets=["basketball.totals"],
-                status="TRADING_LIVE",
-            )
+            data = client.get_events(comp_key, markets=["basketball.totals"], status=None)
         except CloudbetAPIError as exc:
-            logger.debug("扫描联赛失败 %s: %s", comp_key, exc)
+            logger.debug("?????? %s: %s", comp_key, exc)
             continue
 
-        events = [e for e in data.get("events", []) if e.get("status") == "TRADING_LIVE"]
-        if not events:
-            continue
+        kept: List[Dict] = []
+        for event in data.get("events", []) or []:
+            status = str(event.get("status", "")).upper()
+            scanned_events += 1
+            if status:
+                status_counter[status] += 1
+            if allowed_statuses and status not in allowed_statuses:
+                continue
+            event["_competition_key"] = comp_key
+            event["_competition_name"] = data.get("name", comp_key)
+            kept.append(event)
+            matched_events += 1
 
-        competitions.append(
-            {
-                "key": comp_key,
-                "name": data.get("name", comp_key),
-                "events": events,
-            }
-        )
+        if kept:
+            competitions.append(
+                {
+                    "key": comp_key,
+                    "name": data.get("name", comp_key),
+                    "events": kept,
+                }
+            )
 
+        if idx % 20 == 0:
+            logger.info(
+                "Basketball league progress: %d/%d leagues events=%d matched=%d elapsed=%.1fs",
+                idx,
+                total_leagues,
+                scanned_events,
+                matched_events,
+                time.time() - scan_start,
+            )
+
+    logger.info(
+        "Basketball league scan: leagues=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+        total_leagues,
+        scanned_events,
+        matched_events,
+        sorted(allowed_statuses) if allowed_statuses else "ALL",
+        dict(status_counter),
+        time.time() - scan_start,
+    )
     return competitions
-
 def _extract_totals_market(markets: Dict) -> Optional[Dict]:
     """
     从市场字典中提取 basketball.totals（大小分）市场数据
@@ -321,7 +427,16 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     max_stake_pct = cfg["MAX_STAKE_PCT"]
     bankroll = cfg.get("BANKROLL", 100.0)
 
-    competitions = fetch_live_basketball_events(api_key)
+    competitions = fetch_live_basketball_events(
+        api_key,
+        live_statuses=cfg.get("LIVE_STATUSES", ["TRADING_LIVE"]),
+        bulk_from_hours=cfg.get("BULK_FROM_HOURS", 4),
+        bulk_to_hours=cfg.get("BULK_TO_HOURS", 2),
+        prefer_bulk_events_api=cfg.get("PREFER_BULK_EVENTS_API", True),
+        fallback_to_league_scan_on_bulk_failure=cfg.get(
+            "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE", True
+        ),
+    )
     if not competitions:
         logger.info("无直播篮球赛事")
         return []
