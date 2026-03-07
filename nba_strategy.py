@@ -440,6 +440,9 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     blocked_keywords = cfg.get("COMPETITION_BLOCK_KEYWORDS", [])
     min_market_price = float(cfg.get("MIN_MARKET_PRICE", 1.65))
     max_market_price = float(cfg.get("MAX_MARKET_PRICE", 2.20))
+    imputed_score_min_elapsed = float(cfg.get("IMPUTED_SCORE_MIN_ELAPSED", 6.0))
+    imputed_score_extra_edge = float(cfg.get("IMPUTED_SCORE_EXTRA_EDGE", 0.03))
+    imputed_score_stake_mult = max(0.1, min(1.0, float(cfg.get("IMPUTED_SCORE_STAKE_MULT", 0.5))))
     if max_market_price < min_market_price:
         min_market_price, max_market_price = max_market_price, min_market_price
 
@@ -460,6 +463,7 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     signals = []
     skipped_for_comp_keyword = 0
     skipped_for_unreliable_score = 0
+    skipped_for_imputed_early = 0
     skipped_for_price = 0
     skipped_for_edge = 0
     max_edge_seen = float("-inf")
@@ -517,12 +521,17 @@ def generate_signals(cfg: Dict) -> List[Dict]:
 
             current_score = _parse_current_score(event)
             score_reliable = current_score is not None
+            score_imputed = False
             if not score_reliable and require_reliable_score:
                 skipped_for_unreliable_score += 1
                 continue
             if current_score is None:
+                if elapsed_minutes < imputed_score_min_elapsed:
+                    skipped_for_imputed_early += 1
+                    continue
                 expected_so_far = (elapsed_minutes / 48.0) * line
                 current_score = round(expected_so_far)
+                score_imputed = True
                 logger.debug("[%s] 无实时比分，估算当前总分=%d", match_name, current_score)
 
             # ── 模型计算 ──────────────────────────────────────
@@ -540,7 +549,8 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 continue
 
             # ── 信号筛选 ──────────────────────────────────────
-            signal_info = pick_best_side(model_result, min_edge=edge_threshold)
+            effective_edge_threshold = edge_threshold + (imputed_score_extra_edge if score_imputed else 0.0)
+            signal_info = pick_best_side(model_result, min_edge=effective_edge_threshold)
             if signal_info is None:
                 max_edge_seen = max(
                     max_edge_seen,
@@ -579,6 +589,8 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             min_stake = cfg.get("MIN_STAKE", 1.0)
             if stake < min_stake:
                 stake = min_stake   # 满足平台最小注额
+            if score_imputed:
+                stake = max(min_stake, round(float(stake) * imputed_score_stake_mult, 2))
 
             signals.append(
                 {
@@ -602,6 +614,8 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                     "remaining_minutes": round(remaining_minutes, 1),
                     "current_score": current_score,
                     "score_reliable": score_reliable,
+                    "score_source": "feed" if score_reliable else "imputed_from_line",
+                    "score_imputed": score_imputed,
                     "model_result": model_result,
                     "stable_reason": stable_reason,
                 }
@@ -610,10 +624,11 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     # 按 edge 降序排列，优先执行最强信号
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d edge=%d price=%d max_edge=%.3f)",
+        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d imputed_early=%d edge=%d price=%d max_edge=%.3f)",
         len(signals),
         skipped_for_comp_keyword,
         skipped_for_unreliable_score,
+        skipped_for_imputed_early,
         skipped_for_edge,
         skipped_for_price,
         (max_edge_seen if max_edge_seen != float("-inf") else 0.0),

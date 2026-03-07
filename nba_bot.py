@@ -103,6 +103,9 @@ NBA_CONFIG = {
     "COMPETITION_BLOCK_KEYWORDS": ["srl", "virtual", "simulated reality", "esoccer"],
     "MIN_MARKET_PRICE": 1.65,
     "MAX_MARKET_PRICE": 2.20,
+    "IMPUTED_SCORE_MIN_ELAPSED": 6.0,   # 无比分估算仅在开赛 6 分钟后启用
+    "IMPUTED_SCORE_EXTRA_EDGE": 0.03,   # 无比分估算时提高入场 edge
+    "IMPUTED_SCORE_STAKE_MULT": 0.50,   # 无比分估算时缩小仓位
     "SETTLE_BATCH_SIZE": 40,
     "SETTLE_MIN_STAKE": 0.01,
     "SETTLE_STATUSES": ["ACCEPTED", "PENDING"],
