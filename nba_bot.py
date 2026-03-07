@@ -59,7 +59,7 @@ NBA_CONFIG = {
     # ── 仓位 ─────────────────────────────────────────────────
     "KELLY_FRACTION": 0.25,            # 基础 1/4 Kelly
     "KELLY_FRACTION_FLOOR": 0.05,      # 动态收缩下限
-    "MAX_STAKE_PCT": 0.005,            # 单注最大 0.5% 资金
+    "MAX_STAKE_PCT": 0.01,             # 单注最大 1.0% 资金
     "MIN_STAKE": 1.0,                  # 最小注额（平台要求）
     "EDGE_CONFIDENCE_CAP": 0.18,
     "EDGE_CONFIDENCE_FLOOR": 0.35,
@@ -401,7 +401,7 @@ def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_bud
     kelly_mult = dyn_kelly / base_kelly
 
     stake_raw = base_stake * kelly_mult * edge_mult
-    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("MAX_STAKE_PCT", 0.005))
+    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("MAX_STAKE_PCT", 0.01))
     market_cap = float(signal.get("max_stake", bankroll_cap) or bankroll_cap)
     stake = min(stake_raw, bankroll_cap, market_cap)
 

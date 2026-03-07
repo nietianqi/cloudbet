@@ -44,7 +44,7 @@ _DEFAULT_CONFIG = {
     "JUMP_THRESHOLD": 0.08,       # 盘口跳动 > 0.08 视为不稳定
     "PRIOR_WEIGHT": 0.45,         # 贝叶斯先验权重
     "KELLY_FRACTION": 0.25,       # 1/4 Kelly
-    "MAX_STAKE_PCT": 0.005,       # 单注最大 0.5% 资金
+    "MAX_STAKE_PCT": 0.01,        # 单注最大 1.0% 资金
     "MIN_STAKE": 1.0,             # 最小注额
 }
 
