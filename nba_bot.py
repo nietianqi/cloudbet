@@ -100,6 +100,13 @@ NBA_CONFIG = {
     "BULK_TO_HOURS": 2,
     "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE": True,
     "REQUIRE_RELIABLE_SCORE": False,    # Feed 普遍缺比分，启用节奏估算回退
+    "EXTERNAL_SCORE_ENABLED": True,     # 启用外部实时比分（API-BASKETBALL）
+    "EXTERNAL_SCORE_PREFER": True,      # 外部比分命中时优先使用
+    "EXTERNAL_BASKETBALL_KEY": os.environ.get("API_BASKETBALL_KEY", os.environ.get("API_FOOTBALL_KEY", "")),
+    "EXTERNAL_SCORE_MIN_CONFIDENCE": 0.80,
+    "EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS": 240,
+    "EXTERNAL_SCORE_CACHE_TTL_SECS": 45,
+    "EXTERNAL_SCORE_TIMEOUT_SECS": 10,
     "COMPETITION_BLOCK_KEYWORDS": ["srl", "virtual", "simulated reality", "esoccer"],
     "MIN_MARKET_PRICE": 1.65,
     "MAX_MARKET_PRICE": 2.20,

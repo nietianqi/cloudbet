@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 from nba_model import compute_live_total_edge, pick_best_side, kelly_stake
 from cloudbet_client import CloudbetClient, CloudbetAPIError
+from external_scores import fetch_basketball_live_scores, match_external_score_for_event
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,13 @@ _DEFAULT_CONFIG = {
     "KELLY_FRACTION": 0.25,       # 1/4 Kelly
     "MAX_STAKE_PCT": 0.01,        # 单注最大 1.0% 资金
     "MIN_STAKE": 1.0,             # 最小注额
+    "EXTERNAL_SCORE_ENABLED": True,
+    "EXTERNAL_SCORE_PREFER": True,
+    "EXTERNAL_BASKETBALL_KEY": "",
+    "EXTERNAL_SCORE_MIN_CONFIDENCE": 0.80,
+    "EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS": 240,
+    "EXTERNAL_SCORE_CACHE_TTL_SECS": 45,
+    "EXTERNAL_SCORE_TIMEOUT_SECS": 10,
 }
 
 # 全局赔率历史缓存（event_id → [(ts, over_price, under_price), ...]）
@@ -443,6 +451,13 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     imputed_score_min_elapsed = float(cfg.get("IMPUTED_SCORE_MIN_ELAPSED", 6.0))
     imputed_score_extra_edge = float(cfg.get("IMPUTED_SCORE_EXTRA_EDGE", 0.03))
     imputed_score_stake_mult = max(0.1, min(1.0, float(cfg.get("IMPUTED_SCORE_STAKE_MULT", 0.5))))
+    external_score_enabled = bool(cfg.get("EXTERNAL_SCORE_ENABLED", True))
+    external_score_prefer = bool(cfg.get("EXTERNAL_SCORE_PREFER", True))
+    external_key = str(cfg.get("EXTERNAL_BASKETBALL_KEY") or cfg.get("EXTERNAL_SCORE_KEY") or "")
+    external_min_confidence = float(cfg.get("EXTERNAL_SCORE_MIN_CONFIDENCE", 0.80))
+    external_kickoff_tolerance = int(cfg.get("EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS", 240))
+    external_cache_ttl = int(cfg.get("EXTERNAL_SCORE_CACHE_TTL_SECS", 45))
+    external_timeout = int(cfg.get("EXTERNAL_SCORE_TIMEOUT_SECS", 10))
     if max_market_price < min_market_price:
         min_market_price, max_market_price = max_market_price, min_market_price
 
@@ -466,7 +481,23 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     skipped_for_imputed_early = 0
     skipped_for_price = 0
     skipped_for_edge = 0
+    external_match_count = 0
+    external_snapshot_count = 0
     max_edge_seen = float("-inf")
+    external_snapshots: List[Dict] = []
+
+    if external_score_enabled and external_key:
+        try:
+            external_snapshots = fetch_basketball_live_scores(
+                api_key=external_key,
+                cache_ttl_secs=external_cache_ttl,
+                timeout_secs=external_timeout,
+            )
+            external_snapshot_count = len(external_snapshots)
+            if external_snapshot_count > 0:
+                logger.info("External basketball scores loaded: snapshots=%d", external_snapshot_count)
+        except Exception as exc:
+            logger.warning("External basketball score fetch failed: %s", exc)
 
     for comp in competitions:
         comp_name = comp.get("name", "")
@@ -522,6 +553,32 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             current_score = _parse_current_score(event)
             score_reliable = current_score is not None
             score_imputed = False
+            score_source = "feed" if score_reliable else "missing"
+            external_confidence = None
+
+            if external_snapshots and (external_score_prefer or not score_reliable):
+                matched = match_external_score_for_event(
+                    event_home=home_name,
+                    event_away=away_name,
+                    event_kickoff=event.get("cutoffTime") or event.get("startTime"),
+                    event_competition=comp_name,
+                    snapshots=external_snapshots,
+                    min_confidence=external_min_confidence,
+                    kickoff_tolerance_mins=external_kickoff_tolerance,
+                )
+                if matched:
+                    snap = matched["snapshot"]
+                    home_score = int(snap.get("home_score") or 0)
+                    away_score = int(snap.get("away_score") or 0)
+                    current_score = home_score + away_score
+                    ext_elapsed = int(snap.get("elapsed_minutes") or 0)
+                    if ext_elapsed > 0:
+                        elapsed_minutes = min(float(ext_elapsed), 48.0)
+                        remaining_minutes = max(48.0 - elapsed_minutes, 0.0)
+                    score_reliable = True
+                    score_source = f"external:{snap.get('source', 'external')}"
+                    external_confidence = float(matched.get("confidence") or 0.0)
+                    external_match_count += 1
             if not score_reliable and require_reliable_score:
                 skipped_for_unreliable_score += 1
                 continue
@@ -532,6 +589,7 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 expected_so_far = (elapsed_minutes / 48.0) * line
                 current_score = round(expected_so_far)
                 score_imputed = True
+                score_source = "imputed_from_line"
                 logger.debug("[%s] 无实时比分，估算当前总分=%d", match_name, current_score)
 
             # ── 模型计算 ──────────────────────────────────────
@@ -614,8 +672,9 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                     "remaining_minutes": round(remaining_minutes, 1),
                     "current_score": current_score,
                     "score_reliable": score_reliable,
-                    "score_source": "feed" if score_reliable else "imputed_from_line",
+                    "score_source": score_source,
                     "score_imputed": score_imputed,
+                    "external_score_confidence": external_confidence,
                     "model_result": model_result,
                     "stable_reason": stable_reason,
                 }
@@ -624,8 +683,10 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     # 按 edge 降序排列，优先执行最强信号
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d imputed_early=%d edge=%d price=%d max_edge=%.3f)",
+        "Basketball signal scan: candidates=%d (ext:%d/%d skip:comp_kw=%d score=%d imputed_early=%d edge=%d price=%d max_edge=%.3f)",
         len(signals),
+        external_match_count,
+        external_snapshot_count,
         skipped_for_comp_keyword,
         skipped_for_unreliable_score,
         skipped_for_imputed_early,

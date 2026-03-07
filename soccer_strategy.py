@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from cloudbet_client import CloudbetClient
 from soccer_model import InPlayGoalsModel, kelly_stake
 from xg_client import create_xg_client, estimate_xg_from_score_and_time
+from external_scores import fetch_football_live_scores, match_external_score_for_event
 import live_db
 
 logger = logging.getLogger(__name__)
@@ -387,6 +388,13 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         min_market_price, max_market_price = max_market_price, min_market_price
     blocked_elapsed_ranges = cfg.get("blocked_elapsed_ranges", [(30.0, 45.0)])
     competition_block_keywords = cfg.get("competition_block_keywords", [])
+    external_score_enabled = bool(cfg.get("external_score_enabled", True))
+    external_score_prefer = bool(cfg.get("external_score_prefer", True))
+    external_key = str(cfg.get("external_football_key") or cfg.get("af_key") or "")
+    external_min_confidence = float(cfg.get("external_score_min_confidence", 0.80))
+    external_kickoff_tolerance = int(cfg.get("external_score_kickoff_tolerance_mins", 240))
+    external_cache_ttl = int(cfg.get("external_score_cache_ttl_secs", 45))
+    external_timeout = int(cfg.get("external_score_timeout_secs", 10))
     # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
     leagues = cfg.get("leagues")
     live_statuses = cfg.get("live_statuses", ["TRADING_LIVE", "TRADING"])
@@ -429,10 +437,26 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     skipped_for_competition_keyword = 0
     skipped_for_edge = 0
     skipped_for_imputed_early = 0
+    external_match_count = 0
+    external_snapshot_count = 0
     max_edge_seen = float("-inf")
     bad_competitions, comp_stats = _get_bad_competitions(cfg)
     if bad_competitions:
         logger.info("联赛风控门控: bad_competitions=%d (样本窗=%d)", len(bad_competitions), int(cfg.get("competition_guard_window", 240)))
+
+    external_snapshots: List[Dict] = []
+    if external_score_enabled and external_key:
+        try:
+            external_snapshots = fetch_football_live_scores(
+                api_key=external_key,
+                cache_ttl_secs=external_cache_ttl,
+                timeout_secs=external_timeout,
+            )
+            external_snapshot_count = len(external_snapshots)
+            if external_snapshot_count > 0:
+                logger.info("外部足球比分源: snapshots=%d", external_snapshot_count)
+        except Exception as exc:
+            logger.warning("外部足球比分获取失败: %s", exc)
 
     for event in live_events:
         if not isinstance(event, dict):
@@ -472,6 +496,30 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         score_reliable = bool(match_state["score_reliable"])
         score_source = str(match_state["score_source"])
         score_imputed = False
+        external_confidence = None
+
+        if external_snapshots and (external_score_prefer or not score_reliable):
+            matched = match_external_score_for_event(
+                event_home=home_name,
+                event_away=away_name,
+                event_kickoff=event.get("cutoffTime") or event.get("startTime"),
+                event_competition=comp_name,
+                snapshots=external_snapshots,
+                min_confidence=external_min_confidence,
+                kickoff_tolerance_mins=external_kickoff_tolerance,
+            )
+            if matched:
+                snap = matched["snapshot"]
+                goals_home = int(snap.get("home_score") or 0)
+                goals_away = int(snap.get("away_score") or 0)
+                ext_elapsed = int(snap.get("elapsed_minutes") or 0)
+                if ext_elapsed > 0:
+                    elapsed = float(ext_elapsed)
+                score_reliable = True
+                score_source = f"external:{snap.get('source', 'external')}"
+                external_confidence = float(matched.get("confidence") or 0.0)
+                score_imputed = False
+                external_match_count += 1
 
         if not score_reliable and allow_imputed_score:
             imp_h, imp_a, ok = _impute_score_from_line(
@@ -657,6 +705,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "goals_away": goals_away,
                 "score_source": score_source,
                 "score_imputed": score_imputed,
+                "external_score_confidence": external_confidence,
                 "live_xg_home": round(live_xg_h, 3),
                 "live_xg_away": round(live_xg_a, 3),
                 "game_state": game_state,
@@ -676,9 +725,11 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
 
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "足球扫描完成: %d 场直播 → %d 个候选信号 (skip:score=%d imputed_early=%d elapsed=%d edge=%d block=%d comp=%d comp_kw=%d price=%d max_edge=%.3f)",
+        "足球扫描完成: %d 场直播 → %d 个候选信号 (ext:%d/%d skip:score=%d imputed_early=%d elapsed=%d edge=%d block=%d comp=%d comp_kw=%d price=%d max_edge=%.3f)",
         len(live_events),
         len(signals),
+        external_match_count,
+        external_snapshot_count,
         skipped_for_unreliable_score,
         skipped_for_imputed_early,
         skipped_for_elapsed,

@@ -70,6 +70,13 @@ SOCCER_CONFIG = {
     "competition_guard_min_win_rate": 0.30,  # 低于该胜率的联赛暂不下注
     "competition_guard_refresh_secs": 180,
     "competition_block_keywords": ["srl", "virtual", "simulated reality", "esoccer"],
+    "external_score_enabled": True,     # 启用外部实时比分（API-FOOTBALL）
+    "external_score_prefer": True,      # 外部比分可用时优先使用
+    "external_football_key": os.environ.get("API_FOOTBALL_KEY", ""),
+    "external_score_min_confidence": 0.80,
+    "external_score_kickoff_tolerance_mins": 240,
+    "external_score_cache_ttl_secs": 45,
+    "external_score_timeout_secs": 10,
 
     # ── 仓位 ─────────────────────────────────────────────────
     "kelly_fraction": 0.20,             # 基础 1/5 Kelly
