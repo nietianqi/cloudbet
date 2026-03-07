@@ -4,9 +4,9 @@ NBA 直播总分投注机器人 — 主程序
 策略: 篮球 live totals 贝叶斯定价 + 正期望值 (+EV) 入场
 
 运行方式:
-    python nba_bot.py               # 真实下单（需填写 API_KEY）
-    python nba_bot.py --dry-run     # 模拟模式（只记录信号，不下单）
-    python nba_bot.py --play        # 使用 PLAY_EUR 测试资金
+    python nba_bot.py               # 真实下单（USDT，需填写 API_KEY）
+    python nba_bot.py --dry-run     # 已禁用（参数保留兼容，仍为真实下单）
+    python nba_bot.py --play        # 已禁用（参数保留兼容，仍使用 USDT）
 
 风控熔断（自动停机）:
     - 日内亏损 ≥ 10% 资金
@@ -43,7 +43,7 @@ NBA_CONFIG = {
     # "API_KEY": os.environ.get("CLOUDBET_API_KEY", ""),
     "API_KEY":"eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
 
-    "CURRENCY": "USDT",            # 测试资金币种；真实下注改为 USDT
+    "CURRENCY": "USDT",            # 强制真实资金币种
     "BET_URL": "https://sports-api.cloudbet.com/pub/v3/bets/place",
     "ACCOUNT_URL": "https://sports-api.cloudbet.com/pub/v1/account/currencies",
     "BET_HISTORY_URL": "https://sports-api.cloudbet.com/pub/v4/bets/history",
@@ -74,7 +74,7 @@ NBA_CONFIG = {
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
     "PENDING_ORDER_COOLDOWN_SECS": 60, # cooldown after pending response
     "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
-    "DRY_RUN": False,                   # 默认模拟模式；命令行 --real 才切换为真实下单
+    "DRY_RUN": False,               # 强制真实下单（不使用模拟模式）
     "LIVE_STATUSES": ["TRADING_LIVE"],
     "PREFER_BULK_EVENTS_API": True,
     "BULK_FROM_HOURS": 4,
@@ -590,11 +590,11 @@ def run(cfg: Dict) -> None:
 def parse_args():
     parser = argparse.ArgumentParser(description="NBA 直播总分投注机器人")
     parser.add_argument("--dry-run", action="store_true",
-                        help="模拟模式：只记录信号，不实际下单")
+                        help="已禁用：始终真实下单（参数仅保留兼容）")
     parser.add_argument("--play", action="store_true",
-                        help="使用 PLAY_EUR 测试资金（默认）")
+                        help="已禁用：始终使用 USDT（参数仅保留兼容）")
     parser.add_argument("--real", action="store_true",
-                        help="使用 USDT 真实资金")
+                        help="真实资金模式（默认，无需显式传入）")
     parser.add_argument("--edge", type=float, default=None,
                         help="覆盖 edge 阈值（例：0.06 = 6%%）")
     parser.add_argument("--interval", type=int, default=None,
@@ -608,26 +608,12 @@ def main():
     args = parse_args()
     cfg = dict(NBA_CONFIG)
 
-    if args.play and args.real:
-        logger.error("--play ? --real ??????")
-        sys.exit(2)
+    if args.dry_run or args.play:
+        logger.warning("篮球机器人已强制真实投注，忽略 --dry-run/--play 参数")
 
-    if args.dry_run:
-        cfg["DRY_RUN"] = True
-        cfg["CURRENCY"] = "PLAY_EUR" if args.play else "USDT"
-    else:
-        if args.play:
-            cfg["CURRENCY"] = "PLAY_EUR"
-            cfg["DRY_RUN"] = False
-        else:
-            # ???????USDT?
-            cfg["CURRENCY"] = "USDT"
-            cfg["DRY_RUN"] = False
-
-    if args.real:
-        cfg["CURRENCY"] = "USDT"
-        if not args.dry_run:
-            cfg["DRY_RUN"] = False
+    # 强制真实投注（USDT）
+    cfg["DRY_RUN"] = False
+    cfg["CURRENCY"] = "USDT"
 
     if args.edge is not None:
         cfg["EDGE_THRESHOLD"] = args.edge
@@ -640,25 +626,25 @@ def main():
 
     if not cfg["API_KEY"]:
         logger.error(
-            "??? API Key?\n"
-            "???: ???? export CLOUDBET_API_KEY=your_key\n"
-            "???: ??? python nba_bot.py --api-key your_key\n"
-            "???: ???? nba_bot.py ?? NBA_CONFIG['API_KEY']"
+            "未设置 API Key！\n"
+            "方式1: 设置环境变量 CLOUDBET_API_KEY\n"
+            "方式2: 运行 python nba_bot.py --api-key your_key\n"
+            "方式3: 编辑 nba_bot.py 中 NBA_CONFIG['API_KEY']"
         )
         sys.exit(1)
 
     try:
         run(cfg)
     except KeyboardInterrupt:
-        logger.info("\n??????????")
+        logger.info("\n用户中断，机器人退出")
         sys.exit(0)
     except Exception as exc:
-        logger.error("????: %s", exc, exc_info=True)
+        logger.error("系统异常: %s", exc, exc_info=True)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
+
 
 
 
