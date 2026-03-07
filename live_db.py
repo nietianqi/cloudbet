@@ -260,10 +260,16 @@ def update_order_status(
     """更新订单状态（ACCEPTED / REJECTED）"""
     conn = get_connection(db_file)
     if executed_price is not None:
-        conn.execute(
-            "UPDATE orders SET status=?, executed_price=? WHERE reference_id=?",
-            (status, executed_price, reference_id),
-        )
+        if str(status).upper() == "ACCEPTED":
+            conn.execute(
+                "UPDATE orders SET status=?, executed_price=?, reject_reason='' WHERE reference_id=?",
+                (status, executed_price, reference_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE orders SET status=?, executed_price=? WHERE reference_id=?",
+                (status, executed_price, reference_id),
+            )
     elif reject_reason:
         conn.execute(
             "UPDATE orders SET status=?, reject_reason=? WHERE reference_id=?",
@@ -344,6 +350,64 @@ def count_unsettled_accepted_orders(
     row = conn.execute(sql, tuple(params)).fetchone()
     conn.close()
     return int(row["cnt"] or 0) if row else 0
+
+
+def count_unsettled_orders_for_event(
+    event_id: str,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+) -> int:
+    """
+    Count unsettled orders for one event by statuses/sport.
+
+    Useful for event-level dedup to avoid repeat bets when previous orders
+    are still PENDING/ACCEPTED.
+    """
+    if not event_id:
+        return 0
+
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED", "PENDING"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED", "PENDING"]
+
+    placeholders = ",".join("?" for _ in status_list)
+    where_parts = ["o.event_id = ?", f"o.status IN ({placeholders})", "r.id IS NULL"]
+    params: List = [str(event_id)] + status_list
+
+    if sport:
+        where_parts.append("o.sport = ?")
+        params.append(str(sport).lower())
+
+    where_clause = " AND ".join(where_parts)
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE {where_clause}
+        """,
+        tuple(params),
+    ).fetchone()
+    conn.close()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def has_open_order_for_event(
+    event_id: str,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+) -> bool:
+    """Return True when event has unsettled orders in requested statuses."""
+    return count_unsettled_orders_for_event(
+        event_id=event_id,
+        db_file=db_file,
+        sport=sport,
+        statuses=statuses,
+    ) > 0
 
 
 def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:

@@ -99,10 +99,18 @@ NBA_CONFIG = {
     "BULK_FROM_HOURS": 4,
     "BULK_TO_HOURS": 2,
     "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE": True,
+    "REQUIRE_RELIABLE_SCORE": True,
+    "COMPETITION_BLOCK_KEYWORDS": ["srl", "virtual", "simulated reality", "esoccer"],
+    "MIN_MARKET_PRICE": 1.65,
+    "MAX_MARKET_PRICE": 2.20,
     "SETTLE_BATCH_SIZE": 40,
     "SETTLE_MIN_STAKE": 0.01,
     "SETTLE_STATUSES": ["ACCEPTED", "PENDING"],
+    "SETTLE_STATUS_POLL_INTERVAL_SECS": 0.10,
+    "SETTLE_API_FAIL_STREAK_LIMIT": 4,
     "AUTO_CLOSE_ZERO_STAKE_ORDERS": True,
+    "EVENT_DEDUP_STATUSES": ["ACCEPTED", "PENDING"],
+    "API_ERROR_COOLDOWN_SECS": 90,
 
     # ── 数据库 ────────────────────────────────────────────────
     "DB_FILE": "live_betting.db",
@@ -208,7 +216,12 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
 
     try:
         resp = requests.post(cfg["BET_URL"], headers=headers, json=payload, timeout=15)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"status": "ERROR", "message": f"invalid_json_response(status={resp.status_code})"}
+        if not isinstance(data, dict):
+            data = {"status": "ERROR", "message": f"invalid_response_type={type(data).__name__}"}
         status = str(data.get("status", "UNKNOWN")).upper()
         accepted = resp.status_code == 200 and status == "ACCEPTED"
 
@@ -230,6 +243,14 @@ def place_bet(cfg: Dict, signal: Dict, reference_id: Optional[str] = None) -> Di
             "status": "ERROR",
             "executed_price": None,
             "reject_reason": str(exc),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "reference_id": ref_id,
+            "status": "ERROR",
+            "executed_price": None,
+            "reject_reason": f"unexpected_place_error: {exc}",
         }
 
 # ── 风控检查 ──────────────────────────────────────────────────
@@ -501,6 +522,9 @@ def try_settle_pending(cfg: Dict) -> None:
 
     headers = {"X-API-Key": cfg["API_KEY"]}
     settled_count = 0
+    status_poll_interval = max(0.0, float(cfg.get("SETTLE_STATUS_POLL_INTERVAL_SECS", 0.10) or 0.0))
+    fail_streak_limit = max(1, int(cfg.get("SETTLE_API_FAIL_STREAK_LIMIT", 4)))
+    status_fail_streak = 0
     for idx, order in enumerate(pending, start=1):
         ref_id = order.get("reference_id")
         if not ref_id or str(ref_id).startswith("DRY-"):
@@ -508,8 +532,25 @@ def try_settle_pending(cfg: Dict) -> None:
         try:
             url = f"https://sports-api.cloudbet.com/pub/v3/bets/{ref_id}/status"
             resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                status_fail_streak += 1
+                logger.warning(
+                    "结算状态接口受限(%s): %s (连续失败=%d/%d)",
+                    resp.status_code,
+                    ref_id,
+                    status_fail_streak,
+                    fail_streak_limit,
+                )
+                if status_fail_streak >= fail_streak_limit:
+                    logger.warning("结算扫描提前结束：连续接口失败过多，下轮再试")
+                    break
+                if status_poll_interval > 0:
+                    time.sleep(status_poll_interval)
+                continue
+
             if resp.status_code != 200:
                 continue
+            status_fail_streak = 0
             data = resp.json()
             status = str(data.get("status", "")).upper()
 
@@ -575,6 +616,9 @@ def try_settle_pending(cfg: Dict) -> None:
             logger.info("结算: %s | outcome=%s | PnL=%+.2f", order.get("match", ref_id), status, pnl)
         except Exception as exc:
             logger.debug("结算查询失败 %s: %s", ref_id, exc)
+        finally:
+            if status_poll_interval > 0 and idx < len(pending):
+                time.sleep(status_poll_interval)
 
         if idx % 20 == 0 and idx < len(pending):
             logger.info("结算进度: %d/%d", idx, len(pending))
@@ -686,6 +730,22 @@ def run(cfg: Dict) -> None:
 
             if event_id in _bet_events:
                 logger.debug("已下注赛事: %s", signal["match"])
+                continue
+
+            max_bets_per_event = max(1, int(cfg.get("MAX_BETS_PER_EVENT", 1)))
+            open_order_cnt = live_db.count_unsettled_orders_for_event(
+                event_id=event_id,
+                db_file=cfg["DB_FILE"],
+                sport="basketball",
+                statuses=cfg.get("EVENT_DEDUP_STATUSES", ["ACCEPTED", "PENDING"]),
+            )
+            if open_order_cnt >= max_bets_per_event:
+                logger.debug(
+                    "[%s] 同赛事未结算订单=%d (上限=%d)，跳过重复下单",
+                    signal["match"],
+                    open_order_cnt,
+                    max_bets_per_event,
+                )
                 continue
 
             retry_after = float(_event_retry_after.get(event_id, 0.0) or 0.0)
@@ -821,6 +881,9 @@ def run(cfg: Dict) -> None:
                         result["reject_reason"],
                     )
                 else:
+                    if order_status == "ERROR":
+                        api_error_cooldown = int(cfg.get("API_ERROR_COOLDOWN_SECS", 90))
+                        _event_retry_after[event_id] = time.time() + api_error_cooldown
                     logger.info(
                         "⏭️ 跳过: %s | status=%s | 原因=%s",
                         signal["match"],

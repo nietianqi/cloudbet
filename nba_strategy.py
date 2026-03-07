@@ -407,6 +407,16 @@ def _update_odds_cache(event_id: str, over_price: float, under_price: float) -> 
         _odds_cache.pop(eid, None)
 
 
+def _contains_blocked_keyword(*values: str, keywords: Optional[List[str]] = None) -> bool:
+    if not keywords:
+        return False
+    lowered_keywords = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not lowered_keywords:
+        return False
+    combined = " ".join(str(v or "").lower() for v in values)
+    return any(k in combined for k in lowered_keywords)
+
+
 def generate_signals(cfg: Dict) -> List[Dict]:
     """
     主信号生成函数 — 每个轮询周期调用一次
@@ -426,6 +436,12 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     kelly_fraction = cfg["KELLY_FRACTION"]
     max_stake_pct = cfg["MAX_STAKE_PCT"]
     bankroll = cfg.get("BANKROLL", 100.0)
+    require_reliable_score = bool(cfg.get("REQUIRE_RELIABLE_SCORE", True))
+    blocked_keywords = cfg.get("COMPETITION_BLOCK_KEYWORDS", [])
+    min_market_price = float(cfg.get("MIN_MARKET_PRICE", 1.65))
+    max_market_price = float(cfg.get("MAX_MARKET_PRICE", 2.20))
+    if max_market_price < min_market_price:
+        min_market_price, max_market_price = max_market_price, min_market_price
 
     competitions = fetch_live_basketball_events(
         api_key,
@@ -442,10 +458,13 @@ def generate_signals(cfg: Dict) -> List[Dict]:
         return []
 
     signals = []
+    skipped_for_comp_keyword = 0
+    skipped_for_unreliable_score = 0
+    skipped_for_price = 0
 
     for comp in competitions:
         comp_name = comp.get("name", "")
-        if "virtual" in comp_name.lower():
+        if _contains_blocked_keyword(comp_name, keywords=blocked_keywords):
             continue
 
         for event in comp.get("events", []):
@@ -454,6 +473,10 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             away_name = event.get("away", {}).get("name", "N/A")
             match_name = f"{home_name} vs {away_name}"
             status = event.get("status", "")
+
+            if _contains_blocked_keyword(comp_name, match_name, keywords=blocked_keywords):
+                skipped_for_comp_keyword += 1
+                continue
 
             if status != "TRADING_LIVE":
                 continue
@@ -491,13 +514,14 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 continue
 
             current_score = _parse_current_score(event)
+            score_reliable = current_score is not None
+            if not score_reliable and require_reliable_score:
+                skipped_for_unreliable_score += 1
+                continue
             if current_score is None:
-                # 无法获取实时比分，用先验节奏估算（保守处理）
                 expected_so_far = (elapsed_minutes / 48.0) * line
                 current_score = round(expected_so_far)
-                logger.debug(
-                    "[%s] 无实时比分，估算当前总分=%d", match_name, current_score
-                )
+                logger.debug("[%s] 无实时比分，估算当前总分=%d", match_name, current_score)
 
             # ── 模型计算 ──────────────────────────────────────
             try:
@@ -526,6 +550,9 @@ def generate_signals(cfg: Dict) -> List[Dict]:
 
             side = signal_info["side"]
             market_price = over_price if side == "over" else under_price
+            if market_price < min_market_price or market_price > max_market_price:
+                skipped_for_price += 1
+                continue
             market_url = (
                 markets_data["market_url_over"]
                 if side == "over"
@@ -566,6 +593,7 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                     "elapsed_minutes": round(elapsed_minutes, 1),
                     "remaining_minutes": round(remaining_minutes, 1),
                     "current_score": current_score,
+                    "score_reliable": score_reliable,
                     "model_result": model_result,
                     "stable_reason": stable_reason,
                 }
@@ -573,6 +601,13 @@ def generate_signals(cfg: Dict) -> List[Dict]:
 
     # 按 edge 降序排列，优先执行最强信号
     signals.sort(key=lambda s: s["edge"], reverse=True)
+    logger.info(
+        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d price=%d)",
+        len(signals),
+        skipped_for_comp_keyword,
+        skipped_for_unreliable_score,
+        skipped_for_price,
+    )
     return signals
 
 

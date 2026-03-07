@@ -269,6 +269,16 @@ def _is_elapsed_blocked(elapsed: float, blocked_ranges: List) -> bool:
     return False
 
 
+def _contains_blocked_keyword(*values: str, keywords: Optional[List[str]] = None) -> bool:
+    if not keywords:
+        return False
+    lowered_keywords = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not lowered_keywords:
+        return False
+    combined = " ".join(str(v or "").lower() for v in values)
+    return any(k in combined for k in lowered_keywords)
+
+
 def _get_bad_competitions(cfg: Dict) -> Tuple[set, Dict[str, Dict]]:
     if not cfg.get("competition_guard_enabled", True):
         return set(), {}
@@ -338,6 +348,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     if max_market_price < min_market_price:
         min_market_price, max_market_price = max_market_price, min_market_price
     blocked_elapsed_ranges = cfg.get("blocked_elapsed_ranges", [(30.0, 45.0)])
+    competition_block_keywords = cfg.get("competition_block_keywords", [])
     # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
     leagues = cfg.get("leagues")
     live_statuses = cfg.get("live_statuses", ["TRADING_LIVE", "TRADING"])
@@ -377,6 +388,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     skipped_for_price = 0
     skipped_for_elapsed_block = 0
     skipped_for_competition = 0
+    skipped_for_competition_keyword = 0
     bad_competitions, comp_stats = _get_bad_competitions(cfg)
     if bad_competitions:
         logger.info("联赛风控门控: bad_competitions=%d (样本窗=%d)", len(bad_competitions), int(cfg.get("competition_guard_window", 240)))
@@ -391,7 +403,12 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         home_name = home_obj.get("name", "?")
         away_name = away_obj.get("name", "?")
         match_name = f"{home_name} vs {away_name}"
-        comp_name = event.get("_competition_name", "")
+        comp_name = event.get("_competition_name", "") or event.get("competition", "")
+
+        if _contains_blocked_keyword(comp_name, match_name, keywords=competition_block_keywords):
+            skipped_for_competition_keyword += 1
+            logger.debug("[%s] 命中联赛关键词过滤: %s", match_name, comp_name)
+            continue
 
         # ── 提取 total_goals 市场 ──────────────────────────
         market = CloudbetClient.extract_total_goals_market(event)
@@ -583,13 +600,14 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
 
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "足球扫描完成: %d 场直播 → %d 个候选信号 (skip:score=%d elapsed=%d block=%d comp=%d price=%d)",
+        "足球扫描完成: %d 场直播 → %d 个候选信号 (skip:score=%d elapsed=%d block=%d comp=%d comp_kw=%d price=%d)",
         len(live_events),
         len(signals),
         skipped_for_unreliable_score,
         skipped_for_elapsed,
         skipped_for_elapsed_block,
         skipped_for_competition,
+        skipped_for_competition_keyword,
         skipped_for_price,
     )
     return signals

@@ -65,6 +65,7 @@ SOCCER_CONFIG = {
     "competition_guard_min_roi": -0.25, # 低于该 ROI 的联赛暂不下注
     "competition_guard_min_win_rate": 0.30,  # 低于该胜率的联赛暂不下注
     "competition_guard_refresh_secs": 180,
+    "competition_block_keywords": ["srl", "virtual", "simulated reality", "esoccer"],
 
     # ── 仓位 ─────────────────────────────────────────────────
     "kelly_fraction": 0.20,             # 基础 1/5 Kelly
@@ -104,13 +105,17 @@ SOCCER_CONFIG = {
     "sleep_interval": 20,               # 轮询间隔（秒）；足球建议 15-30s
     "accept_price_change": "BETTER",    # NONE/BETTER/ALL
     "max_bets_per_event": 1,            # 每赛事最多下注 1 次
+    "event_dedup_statuses": ["ACCEPTED", "PENDING"],  # 同赛事未结算单去重
     "max_rejects_per_event": 2,        # 同一赛事连续拒单上限（达到后冷却）
     "event_reject_cooldown_secs": 90,  # 同一赛事拒单冷却时间
     "pending_order_cooldown_secs": 60, # 下单返回 pending 后的重试冷却
+    "api_error_cooldown_secs": 90,      # API 错误后赛事冷却（防 429 连续触发）
     "pending_stale_timeout_mins": 20,   # PENDING 超时自动回收，释放在途风险
     "settle_batch_size": 40,           # ?????? 40 ????????
     "settle_min_stake": 0.01,          # ??? stake>0 ?????
     "settle_statuses": ["ACCEPTED", "PENDING"],
+    "settle_status_poll_interval_secs": 0.10,  # 结算状态查询限速
+    "settle_api_fail_streak_limit": 4,         # 连续 429/5xx 超限后本轮停止结算扫描
     "auto_close_zero_stake_orders": True,  # ?????? 0 ????
     # ── 数据 ─────────────────────────────────────────────────
     "db_file": "live_betting.db",
@@ -473,6 +478,14 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             accept_price_change=cfg.get("accept_price_change", "BETTER"),
             reference_id=db_ref_id,
         )
+        if not isinstance(result, dict):
+            return {
+                "success": False,
+                "reference_id": db_ref_id,
+                "status": "ERROR",
+                "executed_price": None,
+                "reject_reason": f"invalid_place_response_type={type(result).__name__}",
+            }
         actual_api_ref = result.get("_referenceId", db_ref_id)
 
     except CloudbetAPIError as exc:
@@ -482,6 +495,14 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
             "status": "ERROR",
             "executed_price": None,
             "reject_reason": str(exc),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "reference_id": db_ref_id,
+            "status": "ERROR",
+            "executed_price": None,
+            "reject_reason": f"unexpected_place_error: {exc}",
         }
 
     status = result.get("status", "UNKNOWN")
@@ -558,12 +579,41 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
     )
 
     settled_count = 0
+    status_poll_interval = max(0.0, float(cfg.get("settle_status_poll_interval_secs", 0.10) or 0.0))
+    fail_streak_limit = max(1, int(cfg.get("settle_api_fail_streak_limit", 4)))
+    status_fail_streak = 0
     for idx, order in enumerate(pending, start=1):
         ref_id = order.get("reference_id", "")
         if not ref_id or ref_id.startswith("DRY-"):
             continue
         try:
             status_data = client.get_bet_status(ref_id)
+            status_fail_streak = 0
+        except CloudbetAPIError as exc:
+            if exc.status_code in (429, 500, 502, 503, 504):
+                status_fail_streak += 1
+                logger.warning(
+                    "结算状态接口受限(%s): %s (连续失败=%d/%d)",
+                    exc.status_code,
+                    ref_id,
+                    status_fail_streak,
+                    fail_streak_limit,
+                )
+                if status_fail_streak >= fail_streak_limit:
+                    logger.warning("结算扫描提前结束：连续接口失败过多，下轮再试")
+                    break
+            else:
+                logger.debug("结算查询失败 %s: %s", ref_id, exc)
+            if status_poll_interval > 0:
+                time.sleep(status_poll_interval)
+            continue
+        except Exception as exc:
+            logger.debug("结算查询失败 %s: %s", ref_id, exc)
+            if status_poll_interval > 0:
+                time.sleep(status_poll_interval)
+            continue
+
+        try:
             status = str(status_data.get("status", "")).upper()
 
             if status in ("", "PENDING", "PENDING_ACCEPTANCE", "PENDING_PROCESSING"):
@@ -636,6 +686,9 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
             logger.info("结算: %s | outcome=%s | PnL=%+.2f", order.get("match", ref_id), outcome, pnl)
         except Exception as exc:
             logger.debug("结算查询失败 %s: %s", ref_id, exc)
+        finally:
+            if status_poll_interval > 0 and idx < len(pending):
+                time.sleep(status_poll_interval)
 
         if idx % 20 == 0 and idx < len(pending):
             logger.info("结算进度: %d/%d", idx, len(pending))
@@ -756,6 +809,22 @@ def run(cfg: Dict) -> None:
             event_id = signal["event_id"]
 
             if event_id in _bet_events:
+                continue
+
+            max_bets_per_event = max(1, int(cfg.get("max_bets_per_event", 1)))
+            open_order_cnt = live_db.count_unsettled_orders_for_event(
+                event_id=event_id,
+                db_file=cfg["db_file"],
+                sport="soccer",
+                statuses=cfg.get("event_dedup_statuses", ["ACCEPTED", "PENDING"]),
+            )
+            if open_order_cnt >= max_bets_per_event:
+                logger.debug(
+                    "[%s] 同赛事未结算订单=%d (上限=%d)，跳过重复下单",
+                    signal["match"],
+                    open_order_cnt,
+                    max_bets_per_event,
+                )
                 continue
 
             retry_after = float(_event_retry_after.get(event_id, 0.0) or 0.0)
@@ -910,6 +979,9 @@ def run(cfg: Dict) -> None:
                         result["reject_reason"],
                     )
                 else:
+                    if order_status == "ERROR":
+                        api_error_cooldown = int(cfg.get("api_error_cooldown_secs", 90))
+                        _event_retry_after[event_id] = time.time() + api_error_cooldown
                     logger.info(
                         "⏭️ 跳过: %s | status=%s | 原因=%s",
                         signal["match"],
