@@ -16,12 +16,12 @@ def test_compute_bankroll_profile_scales_down_on_drawdown_and_vol(monkeypatch):
     monkeypatch.setattr(
         soccer_bot.live_db,
         "get_recent_result_returns",
-        lambda window, db_file: returns,
+        lambda window, db_file, sport=None: returns,
     )
     monkeypatch.setattr(
         soccer_bot.live_db,
         "get_open_exposure",
-        lambda db_file: 8.0,
+        lambda db_file, include_statuses=None, sport=None: 8.0,
     )
 
     profile = soccer_bot.compute_bankroll_profile(cfg, bankroll=800.0)
@@ -54,3 +54,4 @@ def test_size_stake_scientific_respects_budget_and_min_stake():
     stake2, meta2 = soccer_bot.size_stake_scientific(cfg, signal, profile, used_round_budget=2.6)
     assert stake2 == 0.0
     assert meta2["reason"] == "below_min_stake_or_budget"
+

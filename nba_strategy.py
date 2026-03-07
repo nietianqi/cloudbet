@@ -539,6 +539,7 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 bankroll=bankroll,
                 fraction=kelly_fraction,
                 max_pct=max_stake_pct,
+                model_prob=signal_info.get("model_prob"),
             )
             min_stake = cfg.get("MIN_STAKE", 1.0)
             if stake < min_stake:

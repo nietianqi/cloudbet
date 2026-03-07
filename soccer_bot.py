@@ -72,12 +72,18 @@ SOCCER_CONFIG = {
     "vol_factor_floor": 0.35,           # 高波动时最小缩放
     "round_risk_budget_pct": 0.012,     # 单轮总下注预算上限（资金占比）
     "max_open_exposure_pct": 0.03,      # 未结算在途风险上限（资金占比）
+    "min_open_exposure_limit_abs": 10.0, # 在途敞口绝对下限（避免小余额时过早冻结）
+    "open_exposure_scope": "sport", # portfolio=全账户, sport=仅足球
+    "open_exposure_statuses": ["ACCEPTED", "PENDING"],
+    "volatility_scope": "sport",    # portfolio=全账户, sport=仅足球
 
     # ── 风控 ─────────────────────────────────────────────────
     
     "daily_loss_limit_pct": 0.10,       # 日内最大亏损 10%
+    "max_drawdown_stop_pct": 0.30,      # 峰值回撤硬熔断
     "max_consec_losses": 6,             # 连续亏损熔断
     "max_consec_rejects": 5,            # 连续拒单熔断
+    "max_pending_orders": 80,           # 未终态 PENDING 订单上限
     "max_rejection_rate": 0.70,         # 近 N 笔终态单的拒单率上限
     "rejection_rate_window": 100,       # 拒单率统计窗口
     "rejection_rate_min_samples": 30,  # 样本不足时不触发拒单率熔断
@@ -89,6 +95,7 @@ SOCCER_CONFIG = {
     "max_rejects_per_event": 2,        # 同一赛事连续拒单上限（达到后冷却）
     "event_reject_cooldown_secs": 90,  # 同一赛事拒单冷却时间
     "pending_order_cooldown_secs": 60, # 下单返回 pending 后的重试冷却
+    "pending_stale_timeout_mins": 20,   # PENDING 超时自动回收，释放在途风险
     "settle_batch_size": 40,           # ?????? 40 ????????
     "settle_min_stake": 0.01,          # ??? stake>0 ?????
     "settle_statuses": ["ACCEPTED", "PENDING"],
@@ -131,17 +138,26 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
     """返回停机原因，None 表示可继续运行"""
     global _consec_rejects, _consec_losses
 
-    # 日内亏损
+    peak = max(float(cfg.get("_peak_bankroll", balance) or balance), balance)
+    cfg["_peak_bankroll"] = peak
+    drawdown = 0.0 if peak <= 0 else max(0.0, (peak - balance) / peak)
+
+    # 1) 日内亏损
     if start_balance > 0:
         loss_pct = (start_balance - balance) / start_balance
         if loss_pct >= cfg["daily_loss_limit_pct"]:
             return f"日内亏损 {loss_pct:.1%} ≥ 限制 {cfg['daily_loss_limit_pct']:.0%}"
 
-    # 连续拒单
+    # 2) 峰值回撤硬熔断
+    max_dd_stop = float(cfg.get("max_drawdown_stop_pct", 0.30))
+    if drawdown >= max_dd_stop:
+        return f"账户回撤 {drawdown:.1%} ≥ 限制 {max_dd_stop:.0%}"
+
+    # 3) 连续拒单
     if _consec_rejects >= cfg["max_consec_rejects"]:
         return f"连续拒单 {_consec_rejects} 次，暂停执行（检查拒单原因后重启）"
 
-    # 近 N 笔终态单拒单率（按 sport 维度）
+    # 4) 近 N 笔终态单拒单率（按 sport 维度）
     rej_stats = live_db.get_rejection_stats(
         window=int(cfg.get("rejection_rate_window", 100)),
         db_file=cfg["db_file"],
@@ -157,12 +173,24 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
             f"拒单率 {rejection_rate:.1%} > {cfg['max_rejection_rate']:.0%} "
             f"(样本 {total_samples}/{cfg.get('rejection_rate_window', 100)})，Cloudbet 可能已标记账户！"
         )
-    # 连续亏损
+
+    # 5) 待受理积压熔断
+    pending_cap = int(cfg.get("max_pending_orders", 80))
+    if pending_cap > 0:
+        pending_cnt = live_db.count_unsettled_accepted_orders(
+            db_file=cfg["db_file"],
+            min_stake=0.0,
+            statuses=["PENDING"],
+            sport="soccer",
+        )
+        if pending_cnt >= pending_cap:
+            return f"PENDING 积压 {pending_cnt} 笔 ≥ 上限 {pending_cap}"
+
+    # 6) 连续亏损
     if _consec_losses >= cfg["max_consec_losses"]:
         return f"连续亏损 {_consec_losses} 次，策略暂停，请复盘信号质量"
 
     return None
-
 
 # ── 资金管理 ──────────────────────────────────────────────────
 
@@ -194,9 +222,12 @@ def compute_bankroll_profile(cfg: Dict, bankroll: float) -> Dict:
 
     dd_mult = _drawdown_multiplier(cfg, drawdown)
 
+    vol_scope = str(cfg.get("volatility_scope", "portfolio")).lower()
+    vol_sport = "soccer" if vol_scope == "sport" else None
     returns = live_db.get_recent_result_returns(
         window=cfg.get("vol_lookback", 80),
         db_file=cfg["db_file"],
+        sport=vol_sport,
     )
     min_samples = int(cfg.get("min_vol_samples", 20))
     realized_vol = None
@@ -223,9 +254,17 @@ def compute_bankroll_profile(cfg: Dict, bankroll: float) -> Dict:
         base_kelly,
     )
 
-    open_exposure = live_db.get_open_exposure(cfg["db_file"])
+    exposure_scope = str(cfg.get("open_exposure_scope", "portfolio")).lower()
+    exposure_sport = "soccer" if exposure_scope == "sport" else None
+    open_exposure = live_db.get_open_exposure(
+        db_file=cfg["db_file"],
+        include_statuses=cfg.get("open_exposure_statuses", ["ACCEPTED", "PENDING"]),
+        sport=exposure_sport,
+    )
     round_budget = bankroll * float(cfg.get("round_risk_budget_pct", 0.012))
-    open_limit = bankroll * float(cfg.get("max_open_exposure_pct", 0.03))
+    open_limit_pct = bankroll * float(cfg.get("max_open_exposure_pct", 0.03))
+    open_limit_floor = max(0.0, float(cfg.get("min_open_exposure_limit_abs", 0.0)))
+    open_limit = max(open_limit_pct, open_limit_floor)
     available_by_open = max(0.0, open_limit - open_exposure)
     available_round_budget = max(0.0, min(round_budget, available_by_open))
 
@@ -452,6 +491,7 @@ def execute_signal(client: CloudbetClient, cfg: Dict, signal: Dict,
 
 def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
     """结算已接单和待受理订单，并同步最终状态。"""
+    global _consec_losses
     if cfg["dry_run"]:
         return
 
@@ -461,6 +501,16 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
         cleaned = live_db.auto_close_zero_stake_accepted_orders(db_file=db_file)
         if cleaned > 0:
             logger.warning("自动关闭 0 注额 ACCEPTED 订单: %d", cleaned)
+
+    stale_minutes = float(cfg.get("pending_stale_timeout_mins", 20) or 0)
+    if stale_minutes > 0:
+        expired = live_db.auto_expire_stale_pending_orders(
+            db_file=db_file,
+            stale_minutes=stale_minutes,
+            sport="soccer",
+        )
+        if expired > 0:
+            logger.warning("自动回收超时 PENDING 订单: %d (>%s 分钟)", expired, stale_minutes)
 
     settle_min_stake = float(cfg.get("settle_min_stake", 0.01))
     settle_batch_size = max(1, int(cfg.get("settle_batch_size", 40)))
@@ -472,6 +522,7 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
         db_file=db_file,
         min_stake=settle_min_stake,
         statuses=settle_statuses,
+        sport="soccer",
     )
     if total_pending <= 0:
         return
@@ -481,6 +532,7 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
         min_stake=settle_min_stake,
         limit=settle_batch_size,
         statuses=settle_statuses,
+        sport="soccer",
     )
     if not pending:
         return
@@ -564,6 +616,11 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
                 db_file=db_file,
             )
             settled_count += 1
+            if pnl < -1e-9:
+                _consec_losses += 1
+            elif pnl > 1e-9:
+                _consec_losses = 0
+
             logger.info("结算: %s | outcome=%s | PnL=%+.2f", order.get("match", ref_id), outcome, pnl)
         except Exception as exc:
             logger.debug("结算查询失败 %s: %s", ref_id, exc)
@@ -578,7 +635,6 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
             len(pending),
             settled_count,
         )
-
 
 
 
@@ -925,6 +981,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
 
 
 

@@ -16,7 +16,7 @@ SQLite 数据库管理 — 直播投注闭环日志
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 DB_FILE = "live_betting.db"
@@ -107,12 +107,13 @@ CREATE INDEX IF NOT EXISTS idx_results_ref ON results (reference_id);
 # ── 连接 / 初始化 ─────────────────────────────────────────────
 
 def get_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_file)
+    conn = sqlite3.connect(db_file, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 支持并发读
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
-
 
 def init_db(db_file: str = DB_FILE) -> None:
     """初始化数据库（首次运行时建表）"""
@@ -282,6 +283,7 @@ def get_accepted_orders(
     min_stake: float = 0.0,
     limit: Optional[int] = None,
     statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
 ) -> List[Dict]:
     """Return unsettled orders with requested statuses and positive stake."""
     status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
@@ -297,9 +299,13 @@ def get_accepted_orders(
         WHERE o.status IN ({placeholders})
           AND r.id IS NULL
           AND COALESCE(o.stake, 0) > ?
-        ORDER BY o.id ASC
     """
     params: List = status_list + [float(min_stake)]
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
+    sql += " ORDER BY o.id ASC"
     if limit is not None and int(limit) > 0:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -313,6 +319,7 @@ def count_unsettled_accepted_orders(
     db_file: str = DB_FILE,
     min_stake: float = 0.0,
     statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
 ) -> int:
     """Count unsettled orders with requested statuses and positive stake."""
     status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
@@ -330,6 +337,10 @@ def count_unsettled_accepted_orders(
           AND COALESCE(o.stake, 0) > ?
     """
     params: List = status_list + [float(min_stake)]
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
     row = conn.execute(sql, tuple(params)).fetchone()
     conn.close()
     return int(row["cnt"] or 0) if row else 0
@@ -364,6 +375,63 @@ def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:
     return affected
 
 
+
+def auto_expire_stale_pending_orders(
+    db_file: str = DB_FILE,
+    stale_minutes: float = 20.0,
+    sport: Optional[str] = None,
+    reason: str = "AUTO_STALE_PENDING_TIMEOUT",
+) -> int:
+    """
+    Auto-expire long-pending orders to avoid stale exposure blocking new entries.
+
+    Orders are marked as STALE_PENDING only when:
+      - status is PENDING
+      - no settlement row exists
+      - order timestamp is older than now - stale_minutes
+    """
+    try:
+        stale_minutes_val = float(stale_minutes)
+    except (TypeError, ValueError):
+        stale_minutes_val = 20.0
+    stale_minutes_val = max(stale_minutes_val, 0.0)
+
+    cutoff = (datetime.utcnow() - timedelta(minutes=stale_minutes_val)).isoformat() + "Z"
+
+    select_sql = """
+        SELECT o.id
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE o.status = 'PENDING'
+          AND r.id IS NULL
+          AND o.timestamp <= ?
+    """
+    select_params: List = [cutoff]
+    if sport:
+        select_sql += " AND o.sport = ?"
+        select_params.append(str(sport).lower())
+
+    conn = get_connection(db_file)
+    stale_ids = [row["id"] for row in conn.execute(select_sql, tuple(select_params)).fetchall()]
+    if not stale_ids:
+        conn.close()
+        return 0
+
+    placeholders = ",".join("?" for _ in stale_ids)
+    update_sql = f"""
+        UPDATE orders
+        SET status = 'STALE_PENDING',
+            reject_reason = CASE
+                WHEN COALESCE(TRIM(reject_reason), '') = '' THEN ?
+                ELSE reject_reason
+            END
+        WHERE id IN ({placeholders})
+    """
+    cur = conn.execute(update_sql, tuple([str(reason)] + stale_ids))
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
 def repair_pending_acceptance_rejections(db_file: str = DB_FILE) -> int:
     """
     Recover historically misclassified orders:
@@ -466,6 +534,16 @@ def insert_result(result_data: Dict, db_file: str = DB_FILE) -> None:
     """记录结算结果（含 CLV）"""
     now = datetime.utcnow().isoformat() + "Z"
     conn = get_connection(db_file)
+    ref_id = result_data.get("reference_id")
+    if ref_id:
+        existing = conn.execute(
+            "SELECT 1 FROM results WHERE reference_id=? LIMIT 1",
+            (ref_id,),
+        ).fetchone()
+        if existing:
+            conn.close()
+            return
+
     conn.execute(
         """
         INSERT INTO results
@@ -537,22 +615,31 @@ def get_recent_orders_count(minutes: int = 30, db_file: str = DB_FILE) -> int:
 
 
 # -- Risk Helpers ------------------------------------------------------------
-def get_recent_result_returns(window: int = 80, db_file: str = DB_FILE) -> List[float]:
+def get_recent_result_returns(
+    window: int = 80,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+) -> List[float]:
     """
     Return recent settled bet returns as pnl / stake.
     """
     conn = get_connection(db_file)
-    rows = conn.execute(
-        """
-        SELECT stake, pnl
-        FROM results
-        WHERE stake IS NOT NULL AND stake > 0
-          AND pnl IS NOT NULL
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (window,),
-    ).fetchall()
+    sql = """
+        SELECT r.stake, r.pnl
+        FROM results r
+        LEFT JOIN orders o ON r.reference_id = o.reference_id
+        WHERE r.stake IS NOT NULL AND r.stake > 0
+          AND r.pnl IS NOT NULL
+    """
+    params: List = []
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
+    sql += " ORDER BY r.id DESC LIMIT ?"
+    params.append(int(window))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
 
     returns: List[float] = []
@@ -567,26 +654,46 @@ def get_recent_result_returns(window: int = 80, db_file: str = DB_FILE) -> List[
     return returns
 
 
-def get_open_exposure(db_file: str = DB_FILE) -> float:
+def get_open_exposure(
+    db_file: str = DB_FILE,
+    include_statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
+) -> float:
     """
-    Return total stake of accepted but unsettled orders.
+    Return total stake of unsettled orders by statuses/sport.
     """
+    status_list = [
+        str(s).upper()
+        for s in (include_statuses or ["ACCEPTED", "PENDING"])
+        if str(s).strip()
+    ]
+    if not status_list:
+        status_list = ["ACCEPTED", "PENDING"]
+
+    status_ph = ",".join("?" for _ in status_list)
+    where_parts = [f"o.status IN ({status_ph})", "r.id IS NULL"]
+    params: List = list(status_list)
+    if sport:
+        where_parts.append("o.sport = ?")
+        params.append(str(sport).lower())
+
+    where_clause = " AND ".join(where_parts)
+
     conn = get_connection(db_file)
     row = conn.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(o.stake), 0) AS exposure
         FROM orders o
         LEFT JOIN results r ON o.reference_id = r.reference_id
-        WHERE o.status = 'ACCEPTED'
-          AND r.id IS NULL
-        """
+        WHERE {where_clause}
+        """,
+        tuple(params),
     ).fetchone()
     conn.close()
     try:
         return float(row["exposure"] or 0.0) if row else 0.0
     except (TypeError, ValueError):
         return 0.0
-
 
 # -- Self Test ---------------------------------------------------------------
 if __name__ == "__main__":
@@ -661,4 +768,10 @@ if __name__ == "__main__":
 
     os.remove(test_db)
     print("测试通过，测试文件已清理")
+
+
+
+
+
+
 

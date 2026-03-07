@@ -23,6 +23,7 @@ CLV 追踪:
 import argparse
 import json
 import logging
+import statistics
 import sys
 import time
 import uuid
@@ -56,23 +57,41 @@ NBA_CONFIG = {
     "PRIOR_WEIGHT": 0.45,              # 贝叶斯先验权重
 
     # ── 仓位 ─────────────────────────────────────────────────
-    "KELLY_FRACTION": 0.25,            # 1/4 Kelly（保守）
+    "KELLY_FRACTION": 0.25,            # 基础 1/4 Kelly
+    "KELLY_FRACTION_FLOOR": 0.05,      # 动态收缩下限
     "MAX_STAKE_PCT": 0.005,            # 单注最大 0.5% 资金
     "MIN_STAKE": 1.0,                  # 最小注额（平台要求）
+    "EDGE_CONFIDENCE_CAP": 0.18,
+    "EDGE_CONFIDENCE_FLOOR": 0.35,
 
     # ── 风控 ─────────────────────────────────────────────────
     "DAILY_LOSS_LIMIT_PCT": 0.10,      # 日内最大亏损 10%
     "MAX_CONSEC_LOSSES": 5,            # 连续亏损熔断
     "MAX_CONSEC_REJECTS": 5,           # 连续拒单熔断
+    "MAX_PENDING_ORDERS": 120,        # 未终态 PENDING 订单上限
     "MAX_REJECTION_RATE": 0.70,        # 近 N 笔终态单拒单率上限
     "REJECTION_RATE_WINDOW": 100,      # rejection-rate window
     "REJECTION_RATE_MIN_SAMPLES": 30,  # min samples for rejection-rate circuit breaker
     "MAX_CONCURRENT_EXPOSURE_PCT": 0.05, # 同时敞口最大 5%
+    "MIN_OPEN_EXPOSURE_LIMIT_ABS": 10.0, # 在途敞口绝对下限（避免小余额冻结）
+    "DRAWDOWN_SOFT_PCT": 0.08,
+    "DRAWDOWN_HARD_PCT": 0.20,
+    "DRAWDOWN_MIN_FACTOR": 0.35,
+    "MAX_DRAWDOWN_STOP_PCT": 0.30,
+    "VOL_LOOKBACK": 80,
+    "MIN_VOL_SAMPLES": 20,
+    "TARGET_RETURN_VOL": 0.022,
+    "VOL_FACTOR_FLOOR": 0.35,
+    "ROUND_RISK_BUDGET_PCT": 0.012,
+    "OPEN_EXPOSURE_SCOPE": "sport", # portfolio=全账户, sport=仅篮球
+    "OPEN_EXPOSURE_STATUSES": ["ACCEPTED", "PENDING"],
+    "VOLATILITY_SCOPE": "sport",    # portfolio=全账户, sport=仅篮球
 
     # ── 执行控制 ──────────────────────────────────────────────
     "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
     "PENDING_ORDER_COOLDOWN_SECS": 60, # cooldown after pending response
+    "PENDING_STALE_TIMEOUT_MINS": 20, # auto-expire long-pending orders
     "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
     "DRY_RUN": False,               # 强制真实下单（不使用模拟模式）
     "LIVE_STATUSES": ["TRADING_LIVE"],
@@ -219,17 +238,26 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
     """返回停机原因，None 表示可继续运行。"""
     global _consec_rejects, _consec_losses
 
+    peak = max(float(cfg.get("_PEAK_BANKROLL", balance) or balance), balance)
+    cfg["_PEAK_BANKROLL"] = peak
+    drawdown = 0.0 if peak <= 0 else max(0.0, (peak - balance) / peak)
+
     # 1. 日内亏损
     if start_balance > 0:
         loss_pct = (start_balance - balance) / start_balance
         if loss_pct >= cfg["DAILY_LOSS_LIMIT_PCT"]:
             return f"日内亏损 {loss_pct:.1%} ≥ 限制 {cfg['DAILY_LOSS_LIMIT_PCT']:.0%}"
 
-    # 2. 连续拒单
+    # 2. 峰值回撤止损
+    max_dd_stop = float(cfg.get("MAX_DRAWDOWN_STOP_PCT", 0.30))
+    if drawdown >= max_dd_stop:
+        return f"账户回撤 {drawdown:.1%} ≥ 限制 {max_dd_stop:.0%}"
+
+    # 3. 连续拒单
     if _consec_rejects >= cfg["MAX_CONSEC_REJECTS"]:
         return f"连续拒单 {_consec_rejects} 次，暂停执行"
 
-    # 3. 近 N 笔终态单拒单率（按篮球维度）
+    # 4. 近 N 笔终态单拒单率（按篮球维度）
     rej_stats = live_db.get_rejection_stats(
         window=int(cfg.get("REJECTION_RATE_WINDOW", 100)),
         db_file=cfg["DB_FILE"],
@@ -246,13 +274,178 @@ def check_risk_limits(cfg: Dict, balance: float, start_balance: float) -> Option
             f"(样本 {total_samples}/{cfg.get('REJECTION_RATE_WINDOW', 100)})"
         )
 
-    # 4. 连续亏损
+    # 5. 待受理积压
+    pending_cap = int(cfg.get("MAX_PENDING_ORDERS", 120))
+    if pending_cap > 0:
+        pending_cnt = live_db.count_unsettled_accepted_orders(
+            db_file=cfg["DB_FILE"],
+            min_stake=0.0,
+            statuses=["PENDING"],
+            sport="basketball",
+        )
+        if pending_cnt >= pending_cap:
+            return f"PENDING 积压 {pending_cnt} 笔 ≥ 上限 {pending_cap}"
+
+    # 6. 连续亏损
     if _consec_losses >= cfg["MAX_CONSEC_LOSSES"]:
         return f"连续亏损 {_consec_losses} 次，策略暂停复盘"
 
     return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _drawdown_multiplier(cfg: Dict, drawdown: float) -> float:
+    soft = max(0.0, cfg.get("DRAWDOWN_SOFT_PCT", 0.08))
+    hard = max(soft + 1e-6, cfg.get("DRAWDOWN_HARD_PCT", 0.20))
+    floor = _clamp(cfg.get("DRAWDOWN_MIN_FACTOR", 0.35), 0.05, 1.0)
+
+    if drawdown <= soft:
+        return 1.0
+    if drawdown >= hard:
+        return floor
+
+    progress = (drawdown - soft) / (hard - soft)
+    return 1.0 - progress * (1.0 - floor)
+
+
+def compute_bankroll_profile(cfg: Dict, bankroll: float) -> Dict:
+    """动态资金管理画像：回撤约束 + 波动率约束 + 风险预算。"""
+    peak = max(float(cfg.get("_PEAK_BANKROLL", bankroll) or bankroll), bankroll)
+    cfg["_PEAK_BANKROLL"] = peak
+    drawdown = 0.0 if peak <= 0 else max(0.0, (peak - bankroll) / peak)
+
+    dd_mult = _drawdown_multiplier(cfg, drawdown)
+
+    vol_scope = str(cfg.get("VOLATILITY_SCOPE", "portfolio")).lower()
+    vol_sport = "basketball" if vol_scope == "sport" else None
+    returns = live_db.get_recent_result_returns(
+        window=int(cfg.get("VOL_LOOKBACK", 80)),
+        db_file=cfg["DB_FILE"],
+        sport=vol_sport,
+    )
+
+    realized_vol = None
+    min_samples = int(cfg.get("MIN_VOL_SAMPLES", 20))
+    if len(returns) >= min_samples:
+        try:
+            realized_vol = float(statistics.pstdev(returns))
+        except statistics.StatisticsError:
+            realized_vol = None
+
+    vol_mult = 1.0
+    target_vol = max(float(cfg.get("TARGET_RETURN_VOL", 0.022)), 1e-6)
+    if realized_vol and realized_vol > 1e-9:
+        vol_mult = _clamp(
+            target_vol / realized_vol,
+            float(cfg.get("VOL_FACTOR_FLOOR", 0.35)),
+            1.0,
+        )
+
+    base_kelly = max(float(cfg.get("KELLY_FRACTION", 0.25)), 1e-6)
+    dynamic_kelly = base_kelly * dd_mult * vol_mult
+    dynamic_kelly = _clamp(
+        dynamic_kelly,
+        float(cfg.get("KELLY_FRACTION_FLOOR", 0.05)),
+        base_kelly,
+    )
+
+    exposure_scope = str(cfg.get("OPEN_EXPOSURE_SCOPE", "portfolio")).lower()
+    exposure_sport = "basketball" if exposure_scope == "sport" else None
+    open_exposure = live_db.get_open_exposure(
+        db_file=cfg["DB_FILE"],
+        include_statuses=cfg.get("OPEN_EXPOSURE_STATUSES", ["ACCEPTED", "PENDING"]),
+        sport=exposure_sport,
+    )
+
+    round_budget = bankroll * float(cfg.get("ROUND_RISK_BUDGET_PCT", 0.012))
+    open_limit_pct = bankroll * float(cfg.get("MAX_CONCURRENT_EXPOSURE_PCT", 0.05))
+    open_limit_floor = max(0.0, float(cfg.get("MIN_OPEN_EXPOSURE_LIMIT_ABS", 0.0)))
+    open_limit = max(open_limit_pct, open_limit_floor)
+    available_by_open = max(0.0, open_limit - open_exposure)
+    available_round_budget = max(0.0, min(round_budget, available_by_open))
+
+    return {
+        "bankroll": bankroll,
+        "peak": peak,
+        "drawdown": drawdown,
+        "drawdown_mult": dd_mult,
+        "realized_vol": realized_vol,
+        "vol_mult": vol_mult,
+        "base_kelly": base_kelly,
+        "kelly_fraction": dynamic_kelly,
+        "open_exposure": open_exposure,
+        "open_limit": open_limit,
+        "round_budget": round_budget,
+        "available_round_budget": available_round_budget,
+    }
+
+
+def size_stake_scientific(cfg: Dict, signal: Dict, profile: Dict, used_round_budget: float) -> tuple:
+    """基于动态分数 Kelly 计算本信号最终下注额。"""
+    base_stake = float(signal.get("stake") or 0.0)
+    if base_stake <= 0:
+        return 0.0, {"reason": "base_stake_non_positive"}
+
+    threshold = float(cfg.get("EDGE_THRESHOLD", 0.05))
+    edge_cap = max(float(cfg.get("EDGE_CONFIDENCE_CAP", 0.18)), threshold + 1e-6)
+    edge = float(signal.get("edge") or 0.0)
+    edge_norm = _clamp((edge - threshold) / (edge_cap - threshold), 0.0, 1.0)
+    edge_floor = _clamp(float(cfg.get("EDGE_CONFIDENCE_FLOOR", 0.35)), 0.05, 1.0)
+    edge_mult = edge_floor + (1.0 - edge_floor) * edge_norm
+
+    base_kelly = max(float(profile.get("base_kelly", cfg.get("KELLY_FRACTION", 0.25))), 1e-6)
+    dyn_kelly = float(profile.get("kelly_fraction", base_kelly))
+    kelly_mult = dyn_kelly / base_kelly
+
+    stake_raw = base_stake * kelly_mult * edge_mult
+    bankroll_cap = float(profile.get("bankroll", 0.0)) * float(cfg.get("MAX_STAKE_PCT", 0.005))
+    market_cap = float(signal.get("max_stake", bankroll_cap) or bankroll_cap)
+    stake = min(stake_raw, bankroll_cap, market_cap)
+
+    remaining_round_budget = max(0.0, float(profile.get("available_round_budget", 0.0)) - used_round_budget)
+    stake = min(stake, remaining_round_budget)
+
+    min_required = max(
+        float(cfg.get("MIN_STAKE", 1.0)),
+        float(signal.get("min_stake", cfg.get("MIN_STAKE", 1.0)) or cfg.get("MIN_STAKE", 1.0)),
+    )
+
+    can_floor_to_min = (
+        min_required <= bankroll_cap
+        and min_required <= market_cap
+        and min_required <= remaining_round_budget
+    )
+
+    if stake < min_required:
+        if can_floor_to_min:
+            return round(min_required, 2), {
+                "reason": "floored_to_min_stake",
+                "edge_mult": round(edge_mult, 4),
+                "kelly_mult": round(kelly_mult, 4),
+            }
+        return 0.0, {
+            "reason": "below_min_stake_or_budget",
+            "edge_mult": round(edge_mult, 4),
+            "kelly_mult": round(kelly_mult, 4),
+        }
+
+    final_stake = round(stake, 2)
+    return final_stake, {
+        "reason": "ok",
+        "edge_mult": round(edge_mult, 4),
+        "kelly_mult": round(kelly_mult, 4),
+        "dynamic_kelly": round(dyn_kelly, 4),
+        "used_budget_after": round(used_round_budget + final_stake, 2),
+        "round_budget": round(float(profile.get("available_round_budget", 0.0)), 2),
+    }
+
+
 def try_settle_pending(cfg: Dict) -> None:
     """结算已接单和待受理订单，并同步最终状态。"""
+    global _consec_losses
     if cfg["DRY_RUN"]:
         return
 
@@ -262,6 +455,16 @@ def try_settle_pending(cfg: Dict) -> None:
         cleaned = live_db.auto_close_zero_stake_accepted_orders(db_file=db_file)
         if cleaned > 0:
             logger.warning("自动关闭 0 注额 ACCEPTED 订单: %d", cleaned)
+
+    stale_minutes = float(cfg.get("PENDING_STALE_TIMEOUT_MINS", 20) or 0)
+    if stale_minutes > 0:
+        expired = live_db.auto_expire_stale_pending_orders(
+            db_file=db_file,
+            stale_minutes=stale_minutes,
+            sport="basketball",
+        )
+        if expired > 0:
+            logger.warning("自动回收超时 PENDING 订单: %d (>%s 分钟)", expired, stale_minutes)
 
     settle_min_stake = float(cfg.get("SETTLE_MIN_STAKE", 0.01))
     settle_batch_size = max(1, int(cfg.get("SETTLE_BATCH_SIZE", 40)))
@@ -273,6 +476,7 @@ def try_settle_pending(cfg: Dict) -> None:
         db_file=db_file,
         min_stake=settle_min_stake,
         statuses=settle_statuses,
+        sport="basketball",
     )
     if total_pending <= 0:
         return
@@ -282,6 +486,7 @@ def try_settle_pending(cfg: Dict) -> None:
         min_stake=settle_min_stake,
         limit=settle_batch_size,
         statuses=settle_statuses,
+        sport="basketball",
     )
     if not pending:
         return
@@ -362,6 +567,11 @@ def try_settle_pending(cfg: Dict) -> None:
                 db_file=db_file,
             )
             settled_count += 1
+            if pnl < -1e-9:
+                _consec_losses += 1
+            elif pnl > 1e-9:
+                _consec_losses = 0
+
             logger.info("结算: %s | outcome=%s | PnL=%+.2f", order.get("match", ref_id), status, pnl)
         except Exception as exc:
             logger.debug("结算查询失败 %s: %s", ref_id, exc)
@@ -377,13 +587,14 @@ def try_settle_pending(cfg: Dict) -> None:
             settled_count,
         )
 
+
 def run(cfg: Dict) -> None:
     """主运行循环"""
     global _consec_rejects, _consec_losses
 
     logger.info("=" * 70)
     logger.info("  NBA 直播总分机器人启动")
-    logger.info("  策略: 贝叶斯定价 + +EV 入场 + 1/4 Kelly")
+    logger.info("  策略: 贝叶斯定价 + +EV 入场 + 动态分数 Kelly")
     logger.info("  模式: %s", "模拟" if cfg["DRY_RUN"] else "真实下单")
     logger.info("  货币: %s", cfg["CURRENCY"])
     logger.info("  Edge 阈值: %.0f%%", cfg["EDGE_THRESHOLD"] * 100)
@@ -399,15 +610,17 @@ def run(cfg: Dict) -> None:
     except Exception as exc:
         logger.warning("修复历史误判订单失败: %s", exc)
 
-    # 记录今日起始余额（用于日内亏损控制）
+    # 记录起始余额（用于日内亏损控制）
     start_balance = get_balance(cfg)
     if start_balance <= 0:
         if cfg["DRY_RUN"]:
-            logger.warning("????????? 0?????????? 100")
+            logger.warning("起始余额不可用，使用默认值 100")
             start_balance = 100.0
         else:
-            raise RuntimeError("??????????? 0?????")
+            raise RuntimeError("真实模式余额不可用或为 0，停止执行")
+
     cfg["BANKROLL"] = start_balance
+    cfg["_PEAK_BANKROLL"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["CURRENCY"])
 
     round_count = 0
@@ -431,7 +644,6 @@ def run(cfg: Dict) -> None:
             logger.warning("⚠️  熔断停机: %s", stop_reason)
             logger.info("等待 %d 秒后重新检查...", cfg["SLEEP_INTERVAL"] * 4)
             time.sleep(cfg["SLEEP_INTERVAL"] * 4)
-            # 重置连续计数器（允许自动恢复，但需要人工复盘）
             continue
 
         # 尝试结算待处理订单
@@ -452,12 +664,26 @@ def run(cfg: Dict) -> None:
 
         logger.info("发现 %d 个候选信号", len(signals))
 
+        profile = compute_bankroll_profile(cfg, balance)
+        logger.info(
+            "资金管理: bank=%.2f peak=%.2f dd=%.1f%% kelly=%.3f(基=%.3f) vol=%.3f open=%.2f/%.2f round_budget=%.2f",
+            profile["bankroll"],
+            profile["peak"],
+            profile["drawdown"] * 100,
+            profile["kelly_fraction"],
+            profile["base_kelly"],
+            profile["realized_vol"] if profile["realized_vol"] is not None else 0.0,
+            profile["open_exposure"],
+            profile["open_limit"],
+            profile["available_round_budget"],
+        )
+
+        used_round_budget = 0.0
+
         # 执行信号（每个赛事只下一次）
         for signal in signals:
             event_id = signal["event_id"]
 
-            # 去重
-            # 去重
             if event_id in _bet_events:
                 logger.debug("已下注赛事: %s", signal["match"])
                 continue
@@ -466,6 +692,18 @@ def run(cfg: Dict) -> None:
             if retry_after > time.time():
                 continue
 
+            if used_round_budget >= profile["available_round_budget"]:
+                logger.info("本轮资金预算已用尽，停止本轮下单")
+                break
+
+            final_stake, stake_meta = size_stake_scientific(cfg, signal, profile, used_round_budget)
+            if final_stake <= 0:
+                logger.info("[%s] 资金管理跳过: %s", signal.get("match", event_id), stake_meta)
+                continue
+
+            signal["stake"] = final_stake
+            used_round_budget += final_stake
+
             # 记录赔率快照
             live_db.insert_odds_snapshot(
                 {
@@ -473,6 +711,7 @@ def run(cfg: Dict) -> None:
                     "competition": signal["competition"],
                     "home_team": signal["home"],
                     "away_team": signal["away"],
+                    "sport": "basketball",
                     "status": "TRADING_LIVE",
                     "market_url": signal["market_url"],
                     "line": signal["line"],
@@ -495,6 +734,13 @@ def run(cfg: Dict) -> None:
             )
 
             log_signal_summary(signal)
+            logger.info(
+                "   资金管理: kelly_mult=%.3f edge_mult=%.3f budget=%.2f/%.2f",
+                stake_meta.get("kelly_mult", 0.0),
+                stake_meta.get("edge_mult", 0.0),
+                used_round_budget,
+                profile["available_round_budget"],
+            )
 
             # 记录订单（下单前写入，防止 crash 丢失记录）
             ref_id = str(uuid.uuid4())
@@ -502,6 +748,7 @@ def run(cfg: Dict) -> None:
                 {
                     "reference_id": ref_id,
                     "event_id": event_id,
+                    "sport": "basketball",
                     "match": signal["match"],
                     "market_url": signal["market_url"],
                     "side": signal["side"],
@@ -644,6 +891,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
