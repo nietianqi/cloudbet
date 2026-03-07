@@ -54,6 +54,18 @@ SOCCER_CONFIG = {
     "pre_xg_home": 1.40,                # 全联赛均值：主队预期进球
     "pre_xg_away": 1.15,                # 全联赛均值：客队预期进球
 
+    # ── 数据质量门控（基于历史复盘）──────────────────────────
+    "require_reliable_score": True,     # 仅在比分来源可靠时参与定价
+    "min_market_price": 1.70,           # 过滤低赔率（历史 ROI 偏弱）
+    "max_market_price": 2.10,           # 过滤高赔率（历史波动/亏损偏高）
+    "blocked_elapsed_ranges": [(30.0, 45.0)],  # 历史亏损集中时段（左闭右开）
+    "competition_guard_enabled": True,
+    "competition_guard_window": 240,    # 最近已结算样本窗口
+    "competition_guard_min_samples": 5, # 联赛最小样本
+    "competition_guard_min_roi": -0.25, # 低于该 ROI 的联赛暂不下注
+    "competition_guard_min_win_rate": 0.30,  # 低于该胜率的联赛暂不下注
+    "competition_guard_refresh_secs": 180,
+
     # ── 仓位 ─────────────────────────────────────────────────
     "kelly_fraction": 0.20,             # 基础 1/5 Kelly
     "kelly_fraction_floor": 0.05,       # 动态收缩下限

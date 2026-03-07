@@ -179,3 +179,91 @@ def test_auto_expire_stale_pending_orders(tmp_path: Path):
 
     assert pending_left == 1
     assert stale_count == 1
+
+
+def test_recent_competition_performance(tmp_path: Path):
+    db_file = str(tmp_path / "competition_perf.db")
+    live_db.init_db(db_file)
+
+    # Event A (good)
+    live_db.insert_odds_snapshot(
+        {
+            "event_id": "EVT-A",
+            "sport": "soccer",
+            "competition": "CompA",
+            "status": "TRADING_LIVE",
+            "line": 2.5,
+            "over_price": 1.9,
+            "under_price": 1.9,
+        },
+        db_file=db_file,
+    )
+    live_db.insert_order(
+        {
+            "reference_id": "A-1",
+            "event_id": "EVT-A",
+            "sport": "soccer",
+            "stake": 2.0,
+            "status": "ACCEPTED",
+        },
+        db_file=db_file,
+    )
+    live_db.insert_result(
+        {
+            "reference_id": "A-1",
+            "event_id": "EVT-A",
+            "stake": 2.0,
+            "pnl": 1.0,
+            "outcome": "WIN",
+        },
+        db_file=db_file,
+    )
+
+    # Event B (bad)
+    live_db.insert_odds_snapshot(
+        {
+            "event_id": "EVT-B",
+            "sport": "soccer",
+            "competition": "CompB",
+            "status": "TRADING_LIVE",
+            "line": 2.5,
+            "over_price": 1.9,
+            "under_price": 1.9,
+        },
+        db_file=db_file,
+    )
+    live_db.insert_order(
+        {
+            "reference_id": "B-1",
+            "event_id": "EVT-B",
+            "sport": "soccer",
+            "stake": 2.0,
+            "status": "ACCEPTED",
+        },
+        db_file=db_file,
+    )
+    live_db.insert_result(
+        {
+            "reference_id": "B-1",
+            "event_id": "EVT-B",
+            "stake": 2.0,
+            "pnl": -2.0,
+            "outcome": "LOSE",
+        },
+        db_file=db_file,
+    )
+
+    perf = live_db.get_recent_competition_performance(
+        sport="soccer",
+        window=20,
+        min_samples=1,
+        db_file=db_file,
+    )
+
+    assert "CompA" in perf
+    assert "CompB" in perf
+    assert perf["CompA"]["samples"] == 1
+    assert perf["CompA"]["roi"] > 0
+    assert perf["CompA"]["win_rate"] == 1.0
+    assert perf["CompB"]["samples"] == 1
+    assert perf["CompB"]["roi"] < 0

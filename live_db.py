@@ -695,6 +695,84 @@ def get_open_exposure(
     except (TypeError, ValueError):
         return 0.0
 
+
+def get_recent_competition_performance(
+    sport: str = "soccer",
+    window: int = 240,
+    min_samples: int = 1,
+    db_file: str = DB_FILE,
+) -> Dict[str, Dict]:
+    """
+    Return per-competition performance stats from recent settled bets.
+
+    Notes:
+      - Competition is mapped from latest odds_snapshot of the same event_id.
+      - Output values: samples, total_stake, total_pnl, roi, wins, losses, win_rate.
+    """
+    sport_key = str(sport or "").lower()
+    if not sport_key:
+        return {}
+
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        """
+        WITH recent AS (
+            SELECT r.id, r.reference_id, r.pnl, r.stake
+            FROM results r
+            JOIN orders o ON o.reference_id = r.reference_id
+            WHERE o.sport = ?
+            ORDER BY r.id DESC
+            LIMIT ?
+        ),
+        event_comp AS (
+            SELECT os.event_id, os.competition
+            FROM odds_snapshot os
+            JOIN (
+                SELECT event_id, MAX(id) AS max_id
+                FROM odds_snapshot
+                WHERE sport = ?
+                GROUP BY event_id
+            ) x
+            ON os.event_id = x.event_id AND os.id = x.max_id
+        )
+        SELECT
+            COALESCE(ec.competition, 'UNKNOWN') AS competition,
+            COUNT(*) AS samples,
+            SUM(COALESCE(recent.stake, 0)) AS total_stake,
+            SUM(COALESCE(recent.pnl, 0)) AS total_pnl,
+            SUM(CASE WHEN COALESCE(recent.pnl, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN COALESCE(recent.pnl, 0) < 0 THEN 1 ELSE 0 END) AS losses
+        FROM recent
+        JOIN orders o ON o.reference_id = recent.reference_id
+        LEFT JOIN event_comp ec ON ec.event_id = o.event_id
+        GROUP BY COALESCE(ec.competition, 'UNKNOWN')
+        """,
+        (sport_key, int(max(1, window)), sport_key),
+    ).fetchall()
+    conn.close()
+
+    out: Dict[str, Dict] = {}
+    min_n = max(1, int(min_samples))
+    for row in rows:
+        samples = int(row["samples"] or 0)
+        if samples < min_n:
+            continue
+        total_stake = float(row["total_stake"] or 0.0)
+        total_pnl = float(row["total_pnl"] or 0.0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        win_base = max(1, wins + losses)
+        out[str(row["competition"] or "UNKNOWN")] = {
+            "samples": samples,
+            "total_stake": total_stake,
+            "total_pnl": total_pnl,
+            "roi": (total_pnl / total_stake) if total_stake > 0 else 0.0,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / win_base,
+        }
+    return out
+
 # -- Self Test ---------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
