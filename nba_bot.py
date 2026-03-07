@@ -99,7 +99,7 @@ NBA_CONFIG = {
     "BULK_FROM_HOURS": 4,
     "BULK_TO_HOURS": 2,
     "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE": True,
-    "REQUIRE_RELIABLE_SCORE": True,
+    "REQUIRE_RELIABLE_SCORE": False,    # Feed 普遍缺比分，启用节奏估算回退
     "COMPETITION_BLOCK_KEYWORDS": ["srl", "virtual", "simulated reality", "esoccer"],
     "MIN_MARKET_PRICE": 1.65,
     "MAX_MARKET_PRICE": 2.20,

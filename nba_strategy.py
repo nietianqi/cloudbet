@@ -461,6 +461,8 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     skipped_for_comp_keyword = 0
     skipped_for_unreliable_score = 0
     skipped_for_price = 0
+    skipped_for_edge = 0
+    max_edge_seen = float("-inf")
 
     for comp in competitions:
         comp_name = comp.get("name", "")
@@ -540,6 +542,12 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             # ── 信号筛选 ──────────────────────────────────────
             signal_info = pick_best_side(model_result, min_edge=edge_threshold)
             if signal_info is None:
+                max_edge_seen = max(
+                    max_edge_seen,
+                    float(model_result.get("edge_over") or float("-inf")),
+                    float(model_result.get("edge_under") or float("-inf")),
+                )
+                skipped_for_edge += 1
                 logger.debug(
                     "[%s] 无信号: edge_over=%.3f edge_under=%.3f",
                     match_name,
@@ -602,11 +610,13 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     # 按 edge 降序排列，优先执行最强信号
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d price=%d)",
+        "Basketball signal scan: candidates=%d (skip:comp_kw=%d score=%d edge=%d price=%d max_edge=%.3f)",
         len(signals),
         skipped_for_comp_keyword,
         skipped_for_unreliable_score,
+        skipped_for_edge,
         skipped_for_price,
+        (max_edge_seen if max_edge_seen != float("-inf") else 0.0),
     )
     return signals
 

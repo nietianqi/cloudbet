@@ -55,7 +55,11 @@ SOCCER_CONFIG = {
     "pre_xg_away": 1.15,                # 全联赛均值：客队预期进球
 
     # ── 数据质量门控（基于历史复盘）──────────────────────────
-    "require_reliable_score": True,     # 仅在比分来源可靠时参与定价
+    "require_reliable_score": False,    # Feed 普遍缺比分，默认允许估算比分参与
+    "allow_imputed_score": True,        # 无比分时按盘口+进度估算当前比分
+    "imputed_score_min_elapsed": 10.0,  # 估算比分仅在开赛 10 分钟后启用
+    "imputed_score_extra_edge": 0.05,   # 估算比分时提高入场 edge 门槛
+    "imputed_score_stake_mult": 0.50,   # 估算比分时缩小仓位
     "min_market_price": 1.70,           # 过滤低赔率（历史 ROI 偏弱）
     "max_market_price": 2.10,           # 过滤高赔率（历史波动/亏损偏高）
     "blocked_elapsed_ranges": [(30.0, 45.0)],  # 历史亏损集中时段（左闭右开）

@@ -279,6 +279,40 @@ def _contains_blocked_keyword(*values: str, keywords: Optional[List[str]] = None
     return any(k in combined for k in lowered_keywords)
 
 
+def _impute_score_from_line(
+    line: float,
+    elapsed: float,
+    pre_xg_home: float,
+    pre_xg_away: float,
+) -> Tuple[int, int, bool]:
+    """
+    Conservative score imputation when feed score is missing.
+
+    Idea:
+      - Use game progress * live total line to approximate current total goals.
+      - Split home/away by pre-match xG ratio.
+    """
+    try:
+        line_val = float(line)
+        elapsed_val = float(elapsed)
+    except (TypeError, ValueError):
+        return 0, 0, False
+
+    if line_val <= 0 or elapsed_val <= 0:
+        return 0, 0, False
+
+    total_minutes = 90.0 if elapsed_val <= 90.0 else 96.0
+    progress = max(0.0, min(elapsed_val / total_minutes, 1.0))
+    estimated_total = max(0.0, progress * line_val)
+    total_goals = int(round(estimated_total))
+
+    prior_total = max(0.1, float(pre_xg_home) + float(pre_xg_away))
+    home_ratio = max(0.05, min(0.95, float(pre_xg_home) / prior_total))
+    home_goals = int(round(total_goals * home_ratio))
+    away_goals = max(0, total_goals - home_goals)
+    return home_goals, away_goals, True
+
+
 def _get_bad_competitions(cfg: Dict) -> Tuple[set, Dict[str, Dict]]:
     if not cfg.get("competition_guard_enabled", True):
         return set(), {}
@@ -343,6 +377,10 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     live_weight = cfg.get("prior_weight_live", 0.65)
     db_file = cfg.get("db_file", "live_betting.db")
     require_reliable_score = bool(cfg.get("require_reliable_score", True))
+    allow_imputed_score = bool(cfg.get("allow_imputed_score", True))
+    imputed_score_min_elapsed = float(cfg.get("imputed_score_min_elapsed", 10.0))
+    imputed_score_extra_edge = float(cfg.get("imputed_score_extra_edge", 0.04))
+    imputed_score_stake_mult = max(0.1, min(1.0, float(cfg.get("imputed_score_stake_mult", 0.6))))
     min_market_price = float(cfg.get("min_market_price", 1.70))
     max_market_price = float(cfg.get("max_market_price", 2.10))
     if max_market_price < min_market_price:
@@ -389,6 +427,9 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     skipped_for_elapsed_block = 0
     skipped_for_competition = 0
     skipped_for_competition_keyword = 0
+    skipped_for_edge = 0
+    skipped_for_imputed_early = 0
+    max_edge_seen = float("-inf")
     bad_competitions, comp_stats = _get_bad_competitions(cfg)
     if bad_competitions:
         logger.info("联赛风控门控: bad_competitions=%d (样本窗=%d)", len(bad_competitions), int(cfg.get("competition_guard_window", 240)))
@@ -430,10 +471,34 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         elapsed = float(match_state["elapsed"])
         score_reliable = bool(match_state["score_reliable"])
         score_source = str(match_state["score_source"])
+        score_imputed = False
+
+        if not score_reliable and allow_imputed_score:
+            imp_h, imp_a, ok = _impute_score_from_line(
+                line=line,
+                elapsed=elapsed,
+                pre_xg_home=pre_xg_home,
+                pre_xg_away=pre_xg_away,
+            )
+            if ok:
+                goals_home, goals_away = imp_h, imp_a
+                score_reliable = True
+                score_source = "imputed_from_line"
+                score_imputed = True
 
         if require_reliable_score and not score_reliable:
             skipped_for_unreliable_score += 1
             logger.debug("[%s] 比分来源不可靠(%s)，跳过", match_name, score_source)
+            continue
+
+        if score_imputed and elapsed < imputed_score_min_elapsed:
+            skipped_for_imputed_early += 1
+            logger.debug(
+                "[%s] 比分为估算且 elapsed=%.1f < %.1f，跳过",
+                match_name,
+                elapsed,
+                imputed_score_min_elapsed,
+            )
             continue
 
         # ?????????? TRADING ???elapsed ??????????
@@ -519,11 +584,18 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             live_xg_h, live_xg_a, elapsed, game_state
         )
 
-        if signal_info is None or signal_info["edge"] < edge_threshold:
+        if signal_info:
+            max_edge_seen = max(max_edge_seen, float(signal_info.get("edge") or float("-inf")))
+        effective_edge_threshold = edge_threshold + (imputed_score_extra_edge if score_imputed else 0.0)
+        if signal_info is None or signal_info["edge"] < effective_edge_threshold:
+            skipped_for_edge += 1
             if signal_info:
                 logger.debug(
-                    "[%s] edge=%.3f < 阈值 %.3f，跳过",
-                    match_name, signal_info["edge"], edge_threshold
+                    "[%s] edge=%.3f < 阈值 %.3f（%s），跳过",
+                    match_name,
+                    signal_info["edge"],
+                    effective_edge_threshold,
+                    score_source,
                 )
             continue
 
@@ -549,6 +621,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             max_pct=max_stake_pct,
             min_stake=min_stake,
         )
+        if score_imputed:
+            stake = max(min_stake, round(float(stake) * imputed_score_stake_mult, 2))
 
         # 检查平台 maxStake 限制
         max_stake = signal_info.get("max_stake", 9999)
@@ -581,6 +655,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "remaining_minutes": round(remaining_minutes, 1),
                 "goals_home": goals_home,
                 "goals_away": goals_away,
+                "score_source": score_source,
+                "score_imputed": score_imputed,
                 "live_xg_home": round(live_xg_h, 3),
                 "live_xg_away": round(live_xg_a, 3),
                 "game_state": game_state,
@@ -600,15 +676,18 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
 
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "足球扫描完成: %d 场直播 → %d 个候选信号 (skip:score=%d elapsed=%d block=%d comp=%d comp_kw=%d price=%d)",
+        "足球扫描完成: %d 场直播 → %d 个候选信号 (skip:score=%d imputed_early=%d elapsed=%d edge=%d block=%d comp=%d comp_kw=%d price=%d max_edge=%.3f)",
         len(live_events),
         len(signals),
         skipped_for_unreliable_score,
+        skipped_for_imputed_early,
         skipped_for_elapsed,
+        skipped_for_edge,
         skipped_for_elapsed_block,
         skipped_for_competition,
         skipped_for_competition_keyword,
         skipped_for_price,
+        (max_edge_seen if max_edge_seen != float("-inf") else 0.0),
     )
     return signals
 
