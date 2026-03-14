@@ -66,8 +66,7 @@ class APIFootballClient:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "x-rapidapi-key": api_key,
-                "x-rapidapi-host": "v3.football.api-sports.io",
+                "x-apisports-key": api_key,
             }
         )
         self._request_count = 0
@@ -163,10 +162,10 @@ class APIFootballClient:
             return None
 
         result = {}
-        for team_data in raw:
+        for idx, team_data in enumerate(raw):
             team_name = team_data.get("team", {}).get("name", "unknown")
-            is_home = team_data.get("team", {}).get("type", "") == "home"
-            side = "home" if is_home else "away"
+            # API-Football 始终按 [主队, 客队] 顺序返回，无 type 字段
+            side = "home" if idx == 0 else "away"
 
             stats_list = team_data.get("statistics", [])
             stats_map = {
