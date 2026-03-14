@@ -247,6 +247,13 @@ def try_settle_pending(cfg: Dict) -> None:
                 elif status in ("LOSS", "LOSE"):
                     pnl = -stake
 
+                # 更新连续亏损计数器
+                global _consec_losses
+                if pnl < 0:
+                    _consec_losses += 1
+                else:
+                    _consec_losses = 0
+
                 live_db.insert_result(
                     {
                         "reference_id": ref_id,
@@ -293,6 +300,7 @@ def run(cfg: Dict) -> None:
         start_balance = 100.0
     cfg["BANKROLL"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["CURRENCY"])
+    last_reset_date = datetime.now().date()
 
     round_count = 0
     while True:
@@ -300,6 +308,16 @@ def run(cfg: Dict) -> None:
         now_str = datetime.now().strftime("%H:%M:%S")
 
         logger.info("\n%s — 第 %d 轮扫描 (%s)", "─" * 50, round_count, now_str)
+
+        # 按日重置：新的一天重置日内亏损基准
+        today = datetime.now().date()
+        if today != last_reset_date:
+            fresh = get_balance(cfg)
+            if fresh > 0:
+                start_balance = fresh
+            last_reset_date = today
+            _consec_losses = 0
+            logger.info("🔄 新的一天，日内亏损基准重置: %.2f", start_balance)
 
         # 更新余额
         balance = get_balance(cfg)

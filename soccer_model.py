@@ -424,8 +424,11 @@ def kelly_stake(
         return 0.0
 
     stake = fraction * full_kelly * bankroll
-    stake = min(stake, bankroll * max_pct)     # 硬上限
-    stake = max(stake, min_stake)              # 满足平台最小注额
+    stake = min(stake, bankroll * max_pct)     # 硬上限（0.5%）
+    # 满足平台最小注额，但不超过硬上限（避免小资金时 min_stake 突破 max_pct）
+    hard_cap = bankroll * max_pct
+    if min_stake <= hard_cap:
+        stake = max(stake, min_stake)
     return round(stake, 2)
 
 

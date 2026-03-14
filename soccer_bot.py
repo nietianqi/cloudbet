@@ -228,18 +228,28 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
 
             stake = float(order.get("stake") or 0)
             bet_price = float(order.get("executed_price") or order.get("requested_price") or 1.0)
+            returned = float(status_data.get("returnAmount") or 0)
 
             pnl = 0.0
             outcome = status
-            if status == "WIN":
+            if returned > 0:
+                pnl = returned - stake
+            elif status == "WIN":
                 pnl = stake * (bet_price - 1.0)
             elif status in ("LOSS",):
                 pnl = -stake
                 outcome = "LOSE"
             elif status == "PARTIAL_WON":
-                pnl = stake * (bet_price - 1.0) * 0.5
+                pnl = returned - stake if returned > 0 else stake * (bet_price - 1.0) * 0.5
             elif status == "PARTIAL_LOST":
-                pnl = -stake * 0.5
+                pnl = returned - stake if returned > 0 else -stake * 0.5
+
+            # 更新连续亏损计数器（用于熔断）
+            global _consec_losses
+            if pnl < 0:
+                _consec_losses += 1
+            else:
+                _consec_losses = 0
 
             live_db.insert_result(
                 {
@@ -292,12 +302,24 @@ def run(cfg: Dict) -> None:
 
     cfg["bankroll"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["currency"])
+    last_reset_date = datetime.now().date()
 
     round_count = 0
     while True:
         round_count += 1
         logger.info("\n%s — 第 %d 轮 (%s)", "─" * 50, round_count,
                     datetime.now().strftime("%H:%M:%S"))
+
+        # 按日重置：新的一天 start_balance 重置为当前余额
+        today = datetime.now().date()
+        if today != last_reset_date:
+            try:
+                start_balance = client.get_balance(cfg["currency"]) or start_balance
+            except Exception:
+                pass
+            last_reset_date = today
+            _consec_losses = 0
+            logger.info("🔄 新的一天，日内亏损基准重置: %.2f", start_balance)
 
         # 更新余额
         try:
