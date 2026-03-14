@@ -32,46 +32,44 @@ import requests
 
 import live_db
 from nba_strategy import generate_signals, log_signal_summary
+import settings
 
-# ── 配置 ─────────────────────────────────────────────────────
-# 在此填写你的 Trading API Key（或通过环境变量传入）
-import os
-
+# ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 NBA_CONFIG = {
     # ── API ──────────────────────────────────────────────────
-    "API_KEY": os.environ.get("CLOUDBET_API_KEY", ""),
-    "CURRENCY": "PLAY_EUR",            # 测试资金币种；真实下注改为 USDT
+    "API_KEY": settings.CLOUDBET_API_KEY,
+    "CURRENCY": settings.CURRENCY,
     "BET_URL": "https://sports-api.cloudbet.com/pub/v3/bets/place",
     "ACCOUNT_URL": "https://sports-api.cloudbet.com/pub/v1/account/currencies",
     "BET_HISTORY_URL": "https://sports-api.cloudbet.com/pub/v4/bets/history",
 
     # ── 信号阈值 ─────────────────────────────────────────────
-    "EDGE_THRESHOLD": 0.05,            # 最小 edge：5%（建议从 5-6% 起）
-    "MIN_REMAINING_MINUTES": 6.0,      # 距结束至少剩 6 分钟
-    "STABLE_WINDOW_SECS": 20,          # 盘口稳定窗口（秒）
+    "EDGE_THRESHOLD": settings.NBA_EDGE_THRESHOLD,
+    "MIN_REMAINING_MINUTES": settings.NBA_MIN_REMAINING,
+    "STABLE_WINDOW_SECS": settings.NBA_STABLE_WINDOW,
     "JUMP_THRESHOLD": 0.08,            # 盘口跳动阈值
-    "PRIOR_WEIGHT": 0.45,              # 贝叶斯先验权重
+    "PRIOR_WEIGHT": settings.NBA_PRIOR_WEIGHT,
 
     # ── 仓位 ─────────────────────────────────────────────────
-    "KELLY_FRACTION": 0.25,            # 1/4 Kelly（保守）
-    "MAX_STAKE_PCT": 0.005,            # 单注最大 0.5% 资金
-    "MIN_STAKE": 1.0,                  # 最小注额（平台要求）
+    "KELLY_FRACTION": settings.NBA_KELLY_FRACTION,
+    "MAX_STAKE_PCT": settings.NBA_MAX_STAKE_PCT,
+    "MIN_STAKE": settings.NBA_MIN_STAKE,
 
     # ── 风控 ─────────────────────────────────────────────────
-    "DAILY_LOSS_LIMIT_PCT": 0.10,      # 日内最大亏损 10%
-    "MAX_CONSEC_LOSSES": 5,            # 连续亏损熔断
-    "MAX_CONSEC_REJECTS": 5,           # 连续拒单熔断
-    "MAX_REJECTION_RATE": 0.70,        # 近 100 笔拒单率上限
+    "DAILY_LOSS_LIMIT_PCT": settings.NBA_DAILY_LOSS_LIMIT,
+    "MAX_CONSEC_LOSSES": settings.NBA_MAX_CONSEC_LOSSES,
+    "MAX_CONSEC_REJECTS": settings.NBA_MAX_CONSEC_REJECTS,
+    "MAX_REJECTION_RATE": settings.NBA_MAX_REJECTION_RATE,
     "MAX_CONCURRENT_EXPOSURE_PCT": 0.05, # 同时敞口最大 5%
 
     # ── 执行控制 ──────────────────────────────────────────────
-    "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
+    "SLEEP_INTERVAL": settings.NBA_SLEEP_INTERVAL,
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
-    "ACCEPT_PRICE_CHANGE": "NONE",     # NONE=拒绝赔率变差；BETTER=接受更好赔率
-    "DRY_RUN": True,                   # 默认模拟模式；命令行 --real 才切换为真实下单
+    "ACCEPT_PRICE_CHANGE": settings.NBA_ACCEPT_PRICE_CHANGE,
+    "DRY_RUN": settings.DRY_RUN,
 
     # ── 数据库 ────────────────────────────────────────────────
-    "DB_FILE": "live_betting.db",
+    "DB_FILE": settings.DB_FILE,
 }
 
 # 已下注赛事集合（session 内去重，防止对同一赛事多次下注）

@@ -33,18 +33,19 @@ from typing import Dict, Optional
 from cloudbet_client import CloudbetClient, CloudbetAPIError
 import live_db
 from soccer_strategy import generate_soccer_signals, log_soccer_signal
+import settings
 
-# ── 配置 ─────────────────────────────────────────────────────
+# ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 SOCCER_CONFIG = {
     # ── API ──────────────────────────────────────────────────
-    "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
-    "af_key": os.environ.get("API_FOOTBALL_KEY", ""),   # 可选
-    "currency": "PLAY_EUR",
-    "dry_run": True,                    # 默认模拟模式
+    "api_key": settings.CLOUDBET_API_KEY,
+    "af_key": settings.API_FOOTBALL_KEY,
+    "currency": settings.CURRENCY,
+    "dry_run": settings.DRY_RUN,
 
     # ── 信号阈值 ─────────────────────────────────────────────
-    "edge_threshold": 0.06,             # 6% edge 才入场（足球 margin 比篮球高）
-    "min_remaining_minutes": 8.0,       # 至少剩 8 分钟（避免末段暴力反弹）
+    "edge_threshold": settings.SOCCER_EDGE_THRESHOLD,
+    "min_remaining_minutes": settings.SOCCER_MIN_REMAINING,
     "stable_window_secs": 25,           # 稳定性检测窗口
     "jump_threshold": 0.10,             # 盘口跳动阈值
     "prior_weight_live": 0.65,          # 实时 xG 最大权重
@@ -54,23 +55,23 @@ SOCCER_CONFIG = {
     "pre_xg_away": 1.15,                # 全联赛均值：客队预期进球
 
     # ── 仓位 ─────────────────────────────────────────────────
-    "kelly_fraction": 0.25,             # 1/4 Kelly
-    "max_stake_pct": 0.005,             # 单注最大 0.5% 资金
-    "min_stake": 1.0,                   # 最小注额（USDT）
+    "kelly_fraction": settings.SOCCER_KELLY_FRACTION,
+    "max_stake_pct": settings.SOCCER_MAX_STAKE_PCT,
+    "min_stake": settings.SOCCER_MIN_STAKE,
 
     # ── 风控 ─────────────────────────────────────────────────
-    "daily_loss_limit_pct": 0.10,       # 日内最大亏损 10%
-    "max_consec_losses": 6,             # 连续亏损熔断
-    "max_consec_rejects": 5,            # 连续拒单熔断
-    "max_rejection_rate": 0.70,         # 近 100 笔拒单率上限
+    "daily_loss_limit_pct": settings.SOCCER_DAILY_LOSS_LIMIT,
+    "max_consec_losses": settings.SOCCER_MAX_CONSEC_LOSSES,
+    "max_consec_rejects": settings.SOCCER_MAX_CONSEC_REJECTS,
+    "max_rejection_rate": settings.SOCCER_MAX_REJECTION_RATE,
 
     # ── 执行控制 ──────────────────────────────────────────────
-    "sleep_interval": 20,               # 轮询间隔（秒）；足球建议 15-30s
-    "accept_price_change": "BETTER",    # NONE/BETTER/ALL
+    "sleep_interval": settings.SOCCER_SLEEP_INTERVAL,
+    "accept_price_change": settings.SOCCER_ACCEPT_PRICE_CHANGE,
     "max_bets_per_event": 1,            # 每赛事最多下注 1 次
 
     # ── 数据 ─────────────────────────────────────────────────
-    "db_file": "live_betting.db",
+    "db_file": settings.DB_FILE,
 }
 
 # Session 级别状态

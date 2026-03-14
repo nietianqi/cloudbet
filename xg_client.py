@@ -61,14 +61,24 @@ class APIFootballClient:
                  https://dashboard.api-football.com/
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, provider: str = "direct"):
+        """
+        参数:
+            api_key  : API-Football key
+            provider : "direct"   → x-apisports-key（来自 dashboard.api-football.com）
+                       "rapidapi" → x-rapidapi-key（来自 RapidAPI 市场）
+        """
         self.api_key = api_key
         self.session = requests.Session()
-        self.session.headers.update(
-            {
+        if provider == "rapidapi":
+            self.session.headers.update({
+                "x-rapidapi-key": api_key,
+                "x-rapidapi-host": "v3.football.api-sports.io",
+            })
+        else:  # direct（默认）
+            self.session.headers.update({
                 "x-apisports-key": api_key,
-            }
-        )
+            })
         self._request_count = 0
         self._request_day = datetime.utcnow().date()
 
@@ -286,18 +296,26 @@ class NullXGClient:
         return None
 
 
-def create_xg_client(api_key: str = None) -> "APIFootballClient | NullXGClient":
+def create_xg_client(api_key: str = None, provider: str = None) -> "APIFootballClient | NullXGClient":
     """
     工厂函数：有 key 则用真实客户端，否则用 NullXGClient
 
     参数优先级:
-      1. 传入参数 api_key
-      2. 环境变量 API_FOOTBALL_KEY
+      1. 传入参数 api_key / provider
+      2. settings.py（API_FOOTBALL_KEY, APISPORTS_PROVIDER）
+      3. 环境变量 API_FOOTBALL_KEY
     """
-    key = api_key or os.environ.get("API_FOOTBALL_KEY", "")
+    try:
+        import settings as _settings
+        key = api_key or _settings.API_FOOTBALL_KEY or os.environ.get("API_FOOTBALL_KEY", "")
+        prov = provider or _settings.APISPORTS_PROVIDER
+    except ImportError:
+        key = api_key or os.environ.get("API_FOOTBALL_KEY", "")
+        prov = provider or "direct"
+
     if key:
-        logger.info("使用 API-Football 真实 xG 数据")
-        return APIFootballClient(key)
+        logger.info("使用 API-Football 真实 xG 数据 (provider=%s)", prov)
+        return APIFootballClient(key, provider=prov)
     logger.warning("未配置 API_FOOTBALL_KEY，使用先验估算（xG 近似精度较低）")
     return NullXGClient()
 
