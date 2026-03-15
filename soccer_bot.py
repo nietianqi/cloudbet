@@ -71,6 +71,13 @@ SOCCER_CONFIG = {
     "competition_guard_min_win_rate": 0.30,  # 低于该胜率的联赛暂不下注
     "competition_guard_refresh_secs": 180,
     "competition_block_keywords": ["srl", "virtual", "simulated reality", "esoccer"],
+    "fifa_league_filter_enabled": True,      # FIFA 排名门控：前150国家仅一级，前40国家允许一二级
+    "fifa_allow_second_tier_for_top40": True,
+    "competition_country_refresh_secs": 21600,
+    "entry_price_window_secs": 90,           # 入场前回看最近价格窗口（秒）
+    "entry_price_worse_tolerance": 0.02,     # 若当前价较最近最佳差超 2% 则放弃（不追坏价）
+    "edge_robust_price_delta": 0.08,         # 假设成交价再恶化 0.08，做鲁棒 edge 检查
+    "edge_robust_min": 0.01,                 # 鲁棒 edge 至少 1%
     "external_score_enabled": True,     # 启用外部实时比分（API-FOOTBALL）
     "external_score_prefer": True,      # 外部比分可用时优先使用
     "external_football_key": os.environ.get("API_FOOTBALL_KEY", ""),

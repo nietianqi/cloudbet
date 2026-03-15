@@ -8,6 +8,9 @@ env/
 venv/
 ENV/
 
+# 运行产物
+reports/
+
 # 日志和数据文件
 *.log
 *.csv

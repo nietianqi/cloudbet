@@ -22,6 +22,7 @@
 """
 
 import logging
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 _odds_cache: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
 _CACHE_TTL = 300   # 5 分钟后清理过期赛事
 _competition_guard_cache = {"ts": 0.0, "bad": set(), "stats": {}}
+_competition_country_cache = {"ts": 0.0, "by_key": {}, "country_slugs": set()}
 
 # ── 赛前先验来源（简化）─────────────────────────────────────
 # 正式部署应接入 Dixon-Coles 模型（基于历史数据）
@@ -59,6 +61,287 @@ PRIORITY_LEAGUES = [
     "soccer-netherlands-eredivisie",
     "soccer-portugal-primeira-liga",
 ]
+
+# FIFA 排名筛选（数据快照来源：7m FIFA Men's Ranking）
+# 规则：前 150 国家仅一级联赛；前 40 国家允许一级和二级联赛
+_FIFA_TOP40_COUNTRY_SLUGS = {
+    "spain", "argentina", "france", "england", "brazil", "portugal",
+    "netherlands", "morocco", "belgium", "germany", "croatia", "senegal",
+    "italy", "colombia", "usa", "mexico", "uruguay", "switzerland", "japan",
+    "iran", "denmark", "korea-republic", "ecuador", "austria", "turkiye",
+    "nigeria", "australia", "algeria", "canada", "ukraine", "egypt", "norway",
+    "panama", "poland", "wales", "russia", "cote-d-ivoire", "scotland",
+    "serbia", "paraguay",
+}
+
+_FIFA_TOP150_COUNTRY_SLUGS = {
+    "spain", "argentina", "france", "england", "brazil", "portugal", "netherlands", "morocco", "belgium",
+    "germany", "croatia", "senegal", "italy", "colombia", "usa", "mexico", "uruguay", "switzerland", "japan",
+    "iran", "denmark", "korea-republic", "ecuador", "austria", "turkiye", "nigeria", "australia", "algeria",
+    "canada", "ukraine", "egypt", "norway", "panama", "poland", "wales", "russia", "cote-d-ivoire", "scotland",
+    "serbia", "paraguay", "hungary", "sweden", "czech-republic", "slovakia", "cameroon", "greece", "tunisia",
+    "democratic-rep-congo", "romania", "venezuela", "costa-rica", "uzbekistan", "peru", "mali", "chile",
+    "qatar", "slovenia", "iraq", "republic-of-ireland", "south-africa", "saudi-arabia", "burkina-faso", "albania",
+    "jordan", "honduras", "north-macedonia", "cape-verde", "united-arab-emirates", "northern-ireland", "jamaica",
+    "bosnia-herzegovina", "ghana", "georgia", "iceland", "finland", "bolivia", "israel", "oman", "kosovo",
+    "guinea", "curacao", "montenegro", "haiti", "syria", "new-zealand", "gabon", "bulgaria", "uganda", "angola",
+    "bahrain", "zambia", "benin", "china", "guatemala", "palestine", "thailand", "trinidad-tobago", "belarus",
+    "el-salvador", "tajikistan", "mozambique", "luxembourg", "kyrgyzstan", "madagascar", "armenia", "comoros",
+    "equatorial-guinea", "vietnam", "lebanon", "tanzania", "niger", "libya", "kenya", "kazakhstan", "mauritania",
+    "gambia", "sudan", "namibia", "north-korea", "sierra-leone", "malaysia", "indonesia", "suriname", "togo",
+    "faroe-islands", "malawi", "azerbaijan", "cyprus", "estonia", "rwanda", "nicaragua", "zimbabwe",
+    "guinea-bissau", "congo", "kuwait", "philippines", "turkmenistan", "central-african-republic", "latvia",
+    "liberia", "india", "dominican-republic", "lesotho", "botswana", "burundi", "lithuania", "ethiopia",
+    "singapore", "yemen", "new-caledonia",
+}
+
+_FIFA_COUNTRY_ALIASES = {
+    "republic-of-korea": "korea-republic",
+    "south-korea": "korea-republic",
+    "korea-south": "korea-republic",
+    "turkey": "turkiye",
+    "czechia": "czech-republic",
+    "czech-rep": "czech-republic",
+    "bosnia-and-herzegovina": "bosnia-herzegovina",
+    "ivory-coast": "cote-d-ivoire",
+    "cote-divoire": "cote-d-ivoire",
+    "us": "usa",
+    "united-states": "usa",
+}
+
+_LEAGUE_EXCLUDE_MARKERS = {
+    "women", "womens", "female", "friendly", "friendlies", "cup", "playoff", "playoffs", "qualification",
+    "qualifier", "champions-league", "europa-league", "conference-league", "libertadores", "nations-league",
+    "world-cup", "super-cup", "u17", "u18", "u19", "u20", "u21", "u23", "youth", "junior", "juniori", "academy",
+    "reserve", "srl", "virtual", "simulated", "regionalliga", "tercera", "federacion", "league-one", "league-two",
+    "national-league", "state-league", "npl", "southern-league", "isthmian", "northern-premier", "amateur",
+    "primavera", "3rd", "third-division", "danmarksserien", "cfl", "msfl",
+}
+
+_LEAGUE_TIER2_MARKERS = {
+    "championship", "2nd", "second", "serie-b", "liga-2", "ligue-2", "laliga-2", "segunda-division", "primera-b",
+    "primera-nacional", "j-league-2", "2-liga", "2-mfl", "fnl", "esiliiga", "challenge-league", "ascenso",
+    "expansion-mx", "first-division", "super-league-2", "first-division-b",
+}
+
+_LEAGUE_TIER1_MARKERS = {
+    "premier-league", "super-league", "superliga", "bundesliga", "serie-a", "laliga", "la-liga", "ligue-1",
+    "eredivisie", "primeira-liga", "a-league", "hnl", "nb-i", "parva-liga", "virsliga", "a-lyga", "primera-division",
+    "primera-a", "pro-league", "j-league", "league-1", "1-liga", "first-professional-league",
+}
+
+_LEAGUE_TIER2_EXACT_KEYS = {
+    "soccer-england-championship",
+    "soccer-germany-2nd-bundesliga",
+    "soccer-italy-serie-b",
+    "soccer-spain-laliga-2",
+    "soccer-france-ligue-2",
+    "soccer-japan-j-league-2",
+    "soccer-belgium-first-division-b",
+    "soccer-austria-2-liga",
+    "soccer-denmark-1st-division",
+    "soccer-croatia-2-hnl",
+    "soccer-czech-republic-fnl",
+    "soccer-cyprus-2nd-division",
+    "soccer-estonia-esiliiga",
+    "soccer-republic-of-ireland-first-division",
+    "soccer-malta-first-division",
+    "soccer-greece-super-league-2",
+    "soccer-bulgaria-second-prof-league",
+    "soccer-algeria-ligue-2",
+    "soccer-chile-primera-b",
+    "soccer-costa-rica-liga-de-ascenso-apertura",
+    "soccer-mexico-liga-de-ascenso-apertura",
+    "soccer-macedonia-2-mfl",
+    "soccer-chinese-taipei-t816d-second-league",
+}
+
+_FIRST_DIVISION_AS_TIER2_COUNTRIES = {
+    "denmark", "republic-of-ireland", "malta", "estonia", "chinese-taipei",
+}
+
+_CUP_MARKERS = {
+    "cup", "pokal", "coppa", "copa", "trophy", "beker", "super-cup", "league-cup",
+}
+
+_CUP_EXCLUDE_MARKERS = {
+    "qualification", "qualifier", "friendly", "friendlies", "playoff", "playoffs",
+    "women", "womens", "u17", "u18", "u19", "u20", "u21", "u23", "youth", "junior",
+}
+
+_INTERNATIONAL_CUP_MARKERS = {
+    "champions-league", "europa-league", "conference-league", "libertadores",
+    "sudamericana", "nations-league", "world-cup", "afc-champions", "concacaf-champions",
+}
+
+
+def _slugify_text(value: str) -> str:
+    text = str(value or "").lower().strip()
+    if not text:
+        return ""
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")
+
+
+def _normalize_country_slug_for_fifa(country_slug: str) -> str:
+    slug = _slugify_text(country_slug)
+    return _FIFA_COUNTRY_ALIASES.get(slug, slug)
+
+
+def _extract_country_from_comp_key(comp_key: str, known_country_slugs: set) -> str:
+    key = str(comp_key or "").lower()
+    if not key.startswith("soccer-"):
+        return ""
+    tail = key[len("soccer-"):]
+    if not tail:
+        return ""
+
+    for country_slug in sorted(known_country_slugs or set(), key=len, reverse=True):
+        prefix = f"{country_slug}-"
+        if tail.startswith(prefix) or tail == country_slug:
+            return country_slug
+
+    parts = tail.split("-")
+    if len(parts) < 2:
+        return ""
+    return parts[0]
+
+
+def _get_competition_country_map(client: CloudbetClient, refresh_secs: int = 21600) -> Tuple[Dict[str, str], set]:
+    now_ts = time.time()
+    if (
+        _competition_country_cache["by_key"]
+        and (now_ts - float(_competition_country_cache["ts"])) < float(max(60, refresh_secs))
+    ):
+        return (
+            dict(_competition_country_cache["by_key"]),
+            set(_competition_country_cache["country_slugs"]),
+        )
+
+    by_key: Dict[str, str] = {}
+    country_slugs: set = set()
+    try:
+        payload = client.get_competitions("soccer")
+        for category in payload.get("categories", []) or []:
+            raw_country = category.get("name", "")
+            country_slug = _normalize_country_slug_for_fifa(raw_country)
+            if country_slug:
+                country_slugs.add(country_slug)
+            for comp in category.get("competitions", []) or []:
+                key = str(comp.get("key") or "")
+                if key:
+                    by_key[key] = country_slug
+        if by_key:
+            _competition_country_cache["ts"] = now_ts
+            _competition_country_cache["by_key"] = dict(by_key)
+            _competition_country_cache["country_slugs"] = set(country_slugs)
+            return by_key, country_slugs
+    except Exception as exc:
+        logger.debug("读取足球联赛国家映射失败: %s", exc)
+
+    return (
+        dict(_competition_country_cache.get("by_key", {})),
+        set(_competition_country_cache.get("country_slugs", set())),
+    )
+
+
+def _infer_domestic_league_tier(comp_key: str, comp_name: str, country_slug: str) -> Optional[int]:
+    key = str(comp_key or "").lower()
+    name = str(comp_name or "").lower()
+    text = f"{key} {name}"
+    if not key.startswith("soccer-"):
+        return None
+
+    if key in _LEAGUE_TIER2_EXACT_KEYS:
+        return 2
+
+    for marker in _LEAGUE_EXCLUDE_MARKERS:
+        if marker in text:
+            return None
+
+    if (
+        "first-division" in key
+        or "first division" in name
+        or "1st-division" in key
+        or "1st division" in name
+    ):
+        if country_slug in _FIRST_DIVISION_AS_TIER2_COUNTRIES:
+            return 2
+        return 1
+
+    for marker in _LEAGUE_TIER2_MARKERS:
+        if marker in text:
+            return 2
+
+    for marker in _LEAGUE_TIER1_MARKERS:
+        if marker in text:
+            return 1
+
+    return None
+
+
+def _is_cup_competition(comp_key: str, comp_name: str) -> bool:
+    key = str(comp_key or "").lower()
+    name = str(comp_name or "").lower()
+    text = f"{key} {name}"
+    if not any(marker in text for marker in _CUP_MARKERS):
+        return False
+    if any(marker in text for marker in _CUP_EXCLUDE_MARKERS):
+        return False
+    return True
+
+
+def _is_international_competition(comp_key: str, country_slug: str) -> bool:
+    key = str(comp_key or "").lower()
+    if key.startswith("soccer-international-"):
+        return True
+    return country_slug in {"international", "international-clubs"}
+
+
+def _is_international_cup_competition(comp_key: str, comp_name: str, country_slug: str) -> bool:
+    if not _is_international_competition(comp_key, country_slug):
+        return False
+    text = f"{str(comp_key or '').lower()} {str(comp_name or '').lower()}"
+    if any(marker in text for marker in _CUP_EXCLUDE_MARKERS):
+        return False
+    if _is_cup_competition(comp_key, comp_name):
+        return True
+    if any(marker in text for marker in _INTERNATIONAL_CUP_MARKERS):
+        return True
+    return False
+
+
+def _is_allowed_by_fifa_country_tier(
+    country_slug: str,
+    tier: Optional[int],
+    allow_second_tier_for_top40: bool = True,
+    comp_key: str = "",
+    comp_name: str = "",
+) -> Tuple[bool, str]:
+    if _is_international_cup_competition(comp_key, comp_name, country_slug):
+        return True, "ok_international_cup"
+
+    if _is_cup_competition(comp_key, comp_name):
+        if not country_slug:
+            return False, "no_country"
+        if country_slug not in _FIFA_TOP150_COUNTRY_SLUGS:
+            return False, "country_outside_top150"
+        return True, "ok_domestic_cup_top150"
+
+    if not country_slug:
+        return False, "no_country"
+    if tier not in (1, 2):
+        return False, "no_tier"
+    if country_slug not in _FIFA_TOP150_COUNTRY_SLUGS:
+        return False, "country_outside_top150"
+    if country_slug in _FIFA_TOP40_COUNTRY_SLUGS:
+        if tier == 1 or (tier == 2 and allow_second_tier_for_top40):
+            return True, "ok_top40"
+        return False, "tier_not_allowed"
+    if tier == 1:
+        return True, "ok_top150_tier1"
+    return False, "tier_not_allowed"
 
 
 def _update_odds_cache(event_id: str, over_price: float, under_price: float) -> None:
@@ -107,6 +390,54 @@ def _is_odds_stable(
         return False, f"盘口跳动 {max_jump:.3f} > 阈值 {jump_threshold}"
 
     return True, f"稳定 (最大跳动 {max_jump:.3f})"
+
+
+def _recent_best_price(event_id: str, side: str, window_secs: float) -> Optional[float]:
+    """在最近窗口内获取该方向的最佳可成交价格（十进制赔率，越大越好）。"""
+    history = _odds_cache.get(str(event_id or ""), [])
+    if not history:
+        return None
+    now = time.time()
+    recent = [(op, up) for ts, op, up in history if now - ts <= max(1.0, float(window_secs))]
+    if not recent:
+        return None
+    side_norm = str(side or "").lower()
+    prices = [op if side_norm == "over" else up for op, up in recent]
+    prices = [float(p) for p in prices if p and float(p) > 1.0]
+    return max(prices) if prices else None
+
+
+def _is_price_chasing_recent_best(
+    *,
+    current_price: float,
+    recent_best_price: Optional[float],
+    worse_tolerance: float,
+) -> bool:
+    """
+    判断是否在追坏价：
+    - 若当前价格显著低于最近窗口最佳价格，则视为追价，建议放弃。
+    """
+    if recent_best_price is None or recent_best_price <= 1.0:
+        return False
+    tol = max(0.0, float(worse_tolerance))
+    threshold = recent_best_price * (1.0 - tol)
+    return float(current_price) < threshold
+
+
+def _robust_edge_after_price_drop(
+    *,
+    model_prob: float,
+    market_price: float,
+    adverse_price_delta: float,
+) -> float:
+    """
+    价格鲁棒性：
+    假设成交价再恶化 adverse_price_delta（十进制赔率下降），
+    计算该情况下的 edge，避免仅凭脆弱价差入场。
+    """
+    p = max(0.0, min(1.0, float(model_prob)))
+    price = max(1.01, float(market_price) - max(0.0, float(adverse_price_delta)))
+    return p - (1.0 / price)
 
 
 def _get_live_xg(
@@ -388,6 +719,13 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         min_market_price, max_market_price = max_market_price, min_market_price
     blocked_elapsed_ranges = cfg.get("blocked_elapsed_ranges", [(30.0, 45.0)])
     competition_block_keywords = cfg.get("competition_block_keywords", [])
+    fifa_league_filter_enabled = bool(cfg.get("fifa_league_filter_enabled", True))
+    fifa_allow_second_tier_for_top40 = bool(cfg.get("fifa_allow_second_tier_for_top40", True))
+    competition_country_refresh_secs = int(cfg.get("competition_country_refresh_secs", 21600))
+    entry_price_window_secs = float(cfg.get("entry_price_window_secs", 90))
+    entry_price_worse_tolerance = float(cfg.get("entry_price_worse_tolerance", 0.02))
+    edge_robust_price_delta = float(cfg.get("edge_robust_price_delta", 0.08))
+    edge_robust_min = float(cfg.get("edge_robust_min", 0.01))
     external_score_enabled = bool(cfg.get("external_score_enabled", True))
     external_score_prefer = bool(cfg.get("external_score_prefer", True))
     external_key = str(cfg.get("external_football_key") or cfg.get("af_key") or "")
@@ -435,7 +773,13 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     skipped_for_elapsed_block = 0
     skipped_for_competition = 0
     skipped_for_competition_keyword = 0
+    skipped_for_fifa_filter = 0
+    skipped_for_fifa_country = 0
+    skipped_for_fifa_tier = 0
+    skipped_for_fifa_unknown = 0
     skipped_for_edge = 0
+    skipped_for_price_chasing = 0
+    skipped_for_edge_fragile = 0
     skipped_for_imputed_early = 0
     external_match_count = 0
     external_snapshot_count = 0
@@ -443,6 +787,17 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     bad_competitions, comp_stats = _get_bad_competitions(cfg)
     if bad_competitions:
         logger.info("联赛风控门控: bad_competitions=%d (样本窗=%d)", len(bad_competitions), int(cfg.get("competition_guard_window", 240)))
+
+    competition_country_by_key, known_country_slugs = _get_competition_country_map(
+        client,
+        refresh_secs=competition_country_refresh_secs,
+    )
+    if fifa_league_filter_enabled:
+        logger.info(
+            "FIFA 赛事筛选: top150=一级联赛+国内杯赛, top40=一级+二级联赛, 国际杯赛放行(enabled=%s) country_map=%d",
+            fifa_allow_second_tier_for_top40,
+            len(competition_country_by_key),
+        )
 
     external_snapshots: List[Dict] = []
     if external_score_enabled and external_key:
@@ -468,12 +823,48 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         home_name = home_obj.get("name", "?")
         away_name = away_obj.get("name", "?")
         match_name = f"{home_name} vs {away_name}"
+        comp_key = str(event.get("_competition_key") or "")
         comp_name = event.get("_competition_name", "") or event.get("competition", "")
 
         if _contains_blocked_keyword(comp_name, match_name, keywords=competition_block_keywords):
             skipped_for_competition_keyword += 1
             logger.debug("[%s] 命中联赛关键词过滤: %s", match_name, comp_name)
             continue
+
+        country_slug = _normalize_country_slug_for_fifa(
+            competition_country_by_key.get(comp_key, "")
+        )
+        if not country_slug and comp_key:
+            country_slug = _normalize_country_slug_for_fifa(
+                _extract_country_from_comp_key(comp_key, known_country_slugs)
+            )
+        league_tier = _infer_domestic_league_tier(comp_key, comp_name, country_slug)
+
+        if fifa_league_filter_enabled:
+            allowed, reason = _is_allowed_by_fifa_country_tier(
+                country_slug=country_slug,
+                tier=league_tier,
+                allow_second_tier_for_top40=fifa_allow_second_tier_for_top40,
+                comp_key=comp_key,
+                comp_name=comp_name,
+            )
+            if not allowed:
+                skipped_for_fifa_filter += 1
+                if reason == "country_outside_top150":
+                    skipped_for_fifa_country += 1
+                elif reason == "tier_not_allowed":
+                    skipped_for_fifa_tier += 1
+                else:
+                    skipped_for_fifa_unknown += 1
+                logger.debug(
+                    "[%s] FIFA 联赛筛选跳过: reason=%s country=%s tier=%s key=%s",
+                    match_name,
+                    reason,
+                    country_slug or "?",
+                    league_tier if league_tier is not None else "?",
+                    comp_key or "?",
+                )
+                continue
 
         # ── 提取 total_goals 市场 ──────────────────────────
         market = CloudbetClient.extract_total_goals_market(event)
@@ -659,6 +1050,45 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             )
             continue
 
+        side = str(signal_info.get("side") or "").lower()
+        recent_best_price = _recent_best_price(
+            event_id=event_id,
+            side=side,
+            window_secs=entry_price_window_secs,
+        )
+        if _is_price_chasing_recent_best(
+            current_price=market_price,
+            recent_best_price=recent_best_price,
+            worse_tolerance=entry_price_worse_tolerance,
+        ):
+            skipped_for_price_chasing += 1
+            logger.debug(
+                "[%s] 追坏价过滤: side=%s 当前=%.3f 最近最佳=%.3f 容忍=%.1f%%",
+                match_name,
+                side,
+                market_price,
+                float(recent_best_price or 0.0),
+                entry_price_worse_tolerance * 100.0,
+            )
+            continue
+
+        robust_edge = _robust_edge_after_price_drop(
+            model_prob=float(signal_info.get("model_prob") or 0.0),
+            market_price=market_price,
+            adverse_price_delta=edge_robust_price_delta,
+        )
+        if robust_edge < edge_robust_min:
+            skipped_for_edge_fragile += 1
+            logger.debug(
+                "[%s] 脆弱 edge 过滤: edge=%.3f robust=%.3f 阈值=%.3f (delta=%.2f)",
+                match_name,
+                float(signal_info.get("edge") or 0.0),
+                robust_edge,
+                edge_robust_min,
+                edge_robust_price_delta,
+            )
+            continue
+
         # ── Kelly 仓位 ────────────────────────────────────
         stake = kelly_stake(
             edge=signal_info["edge"],
@@ -683,6 +1113,8 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "event_id": event_id,
                 "match": match_name,
                 "competition": comp_name,
+                "country_slug": country_slug,
+                "league_tier": league_tier,
                 "home": home_name,
                 "away": away_name,
                 "sport": "soccer",
@@ -694,9 +1126,11 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "market_url": signal_info["market_url"],
                 "stake": stake,
                 "edge": signal_info["edge"],
+                "edge_robust": round(float(robust_edge), 4),
                 "model_prob": signal_info["model_prob"],
                 "mkt_prob": signal_info["mkt_prob"],
                 "fair_price": signal_info["fair_price"],
+                "recent_best_price": recent_best_price,
                 "max_stake": signal_info.get("max_stake", 9999),
                 "min_stake": signal_info.get("min_stake", min_stake),
                 "elapsed_minutes": elapsed,
@@ -725,7 +1159,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
 
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "足球扫描完成: %d 场直播 → %d 个候选信号 (ext:%d/%d skip:score=%d imputed_early=%d elapsed=%d edge=%d block=%d comp=%d comp_kw=%d price=%d max_edge=%.3f)",
+        "足球扫描完成: %d 场直播 → %d 个候选信号 (ext:%d/%d skip:score=%d imputed_early=%d elapsed=%d edge=%d fragile=%d chase=%d block=%d comp=%d comp_kw=%d fifa=%d[country=%d tier=%d unknown=%d] price=%d max_edge=%.3f)",
         len(live_events),
         len(signals),
         external_match_count,
@@ -734,9 +1168,15 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         skipped_for_imputed_early,
         skipped_for_elapsed,
         skipped_for_edge,
+        skipped_for_edge_fragile,
+        skipped_for_price_chasing,
         skipped_for_elapsed_block,
         skipped_for_competition,
         skipped_for_competition_keyword,
+        skipped_for_fifa_filter,
+        skipped_for_fifa_country,
+        skipped_for_fifa_tier,
+        skipped_for_fifa_unknown,
         skipped_for_price,
         (max_edge_seen if max_edge_seen != float("-inf") else 0.0),
     )
