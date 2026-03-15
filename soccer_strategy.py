@@ -35,6 +35,9 @@ import live_db
 
 logger = logging.getLogger(__name__)
 
+# ── fixture_matcher 单例（跨轮询复用，保留 60 秒缓存）────────
+_fixture_matcher: Optional[FixtureMatcher] = None
+
 # ── 赔率历史缓存（用于稳定性检测）────────────────────────────
 # {event_id: [(timestamp, over_price, under_price), ...]}
 _odds_cache: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
@@ -363,6 +366,11 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     """
     client = CloudbetClient(cfg["api_key"])
     xg_client = create_xg_client(cfg.get("af_key"))
+
+    # 单例：首次创建后跨轮询复用（保留 60 秒 fixture 缓存）
+    global _fixture_matcher
+    if _fixture_matcher is None:
+        _fixture_matcher = FixtureMatcher(xg_client)
 
     edge_threshold = cfg.get("edge_threshold", 0.06)
     min_remaining = cfg.get("min_remaining_minutes", 8.0)

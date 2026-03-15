@@ -34,11 +34,9 @@ import requests
 
 import live_db
 from nba_strategy import generate_signals, log_signal_summary
+import settings
 
-# ── 配置 ─────────────────────────────────────────────────────
-# 在此填写你的 Trading API Key（或通过环境变量传入）
-import os
-
+# ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 NBA_CONFIG = {
     # ── API ──────────────────────────────────────────────────
     # "API_KEY": os.environ.get("CLOUDBET_API_KEY", ""),
@@ -50,11 +48,11 @@ NBA_CONFIG = {
     "BET_HISTORY_URL": "https://sports-api.cloudbet.com/pub/v4/bets/history",
 
     # ── 信号阈值 ─────────────────────────────────────────────
-    "EDGE_THRESHOLD": 0.05,            # 最小 edge：5%（建议从 5-6% 起）
-    "MIN_REMAINING_MINUTES": 6.0,      # 距结束至少剩 6 分钟
-    "STABLE_WINDOW_SECS": 20,          # 盘口稳定窗口（秒）
+    "EDGE_THRESHOLD": settings.NBA_EDGE_THRESHOLD,
+    "MIN_REMAINING_MINUTES": settings.NBA_MIN_REMAINING,
+    "STABLE_WINDOW_SECS": settings.NBA_STABLE_WINDOW,
     "JUMP_THRESHOLD": 0.08,            # 盘口跳动阈值
-    "PRIOR_WEIGHT": 0.45,              # 贝叶斯先验权重
+    "PRIOR_WEIGHT": settings.NBA_PRIOR_WEIGHT,
 
     # ── 仓位 ─────────────────────────────────────────────────
     "KELLY_FRACTION": 0.25,            # 基础 1/4 Kelly
@@ -88,7 +86,7 @@ NBA_CONFIG = {
     "VOLATILITY_SCOPE": "sport",    # portfolio=全账户, sport=仅篮球
 
     # ── 执行控制 ──────────────────────────────────────────────
-    "SLEEP_INTERVAL": 15,              # 轮询间隔（秒）；直播建议 10-20 秒
+    "SLEEP_INTERVAL": settings.NBA_SLEEP_INTERVAL,
     "MAX_BETS_PER_EVENT": 1,           # 每个赛事最多下注 1 次
     "PENDING_ORDER_COOLDOWN_SECS": 60, # cooldown after pending response
     "PENDING_STALE_TIMEOUT_MINS": 20, # auto-expire long-pending orders
@@ -123,7 +121,7 @@ NBA_CONFIG = {
     "API_ERROR_COOLDOWN_SECS": 90,
 
     # ── 数据库 ────────────────────────────────────────────────
-    "DB_FILE": "live_betting.db",
+    "DB_FILE": settings.DB_FILE,
 }
 
 # 已下注赛事集合（session 内去重，防止对同一赛事多次下注）
@@ -676,6 +674,7 @@ def run(cfg: Dict) -> None:
     cfg["BANKROLL"] = start_balance
     cfg["_PEAK_BANKROLL"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["CURRENCY"])
+    last_reset_date = datetime.now().date()
 
     round_count = 0
     while True:
@@ -683,6 +682,16 @@ def run(cfg: Dict) -> None:
         now_str = datetime.now().strftime("%H:%M:%S")
 
         logger.info("\n%s — 第 %d 轮扫描 (%s)", "─" * 50, round_count, now_str)
+
+        # 按日重置：新的一天重置日内亏损基准
+        today = datetime.now().date()
+        if today != last_reset_date:
+            fresh = get_balance(cfg)
+            if fresh > 0:
+                start_balance = fresh
+            last_reset_date = today
+            _consec_losses = 0
+            logger.info("🔄 新的一天，日内亏损基准重置: %.2f", start_balance)
 
         # 更新余额
         balance = get_balance(cfg)

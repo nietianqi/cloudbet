@@ -31,8 +31,9 @@ from typing import Dict, Optional
 from cloudbet_client import CloudbetClient, CloudbetAPIError
 import live_db
 from soccer_strategy import generate_soccer_signals, log_soccer_signal
+import settings
 
-# ── 配置 ─────────────────────────────────────────────────────
+# ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 SOCCER_CONFIG = {
     # ── API ──────────────────────────────────────────────────
     # "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
@@ -113,8 +114,8 @@ SOCCER_CONFIG = {
     "rejection_rate_min_samples": 30,  # 样本不足时不触发拒单率熔断
 
     # ── 执行控制 ──────────────────────────────────────────────
-    "sleep_interval": 20,               # 轮询间隔（秒）；足球建议 15-30s
-    "accept_price_change": "BETTER",    # NONE/BETTER/ALL
+    "sleep_interval": settings.SOCCER_SLEEP_INTERVAL,
+    "accept_price_change": settings.SOCCER_ACCEPT_PRICE_CHANGE,
     "max_bets_per_event": 1,            # 每赛事最多下注 1 次
     "event_dedup_statuses": ["ACCEPTED", "PENDING"],  # 同赛事未结算单去重
     "max_rejects_per_event": 2,        # 同一赛事连续拒单上限（达到后冷却）
@@ -662,18 +663,28 @@ def try_settle_pending(client: CloudbetClient, cfg: Dict) -> None:
 
             stake = float(order.get("stake") or 0)
             bet_price = float(order.get("executed_price") or order.get("requested_price") or 1.0)
+            returned = float(status_data.get("returnAmount") or 0)
 
             pnl = 0.0
             outcome = status
-            if status == "WIN":
+            if returned > 0:
+                pnl = returned - stake
+            elif status == "WIN":
                 pnl = stake * (bet_price - 1.0)
             elif status == "LOSS":
                 pnl = -stake
                 outcome = "LOSE"
             elif status == "PARTIAL_WON":
-                pnl = stake * (bet_price - 1.0) * 0.5
+                pnl = returned - stake if returned > 0 else stake * (bet_price - 1.0) * 0.5
             elif status == "PARTIAL_LOST":
-                pnl = -stake * 0.5
+                pnl = returned - stake if returned > 0 else -stake * 0.5
+
+            # 更新连续亏损计数器（用于熔断）
+            global _consec_losses
+            if pnl < 0:
+                _consec_losses += 1
+            else:
+                _consec_losses = 0
 
             live_db.insert_result(
                 {
@@ -756,11 +767,23 @@ def run(cfg: Dict) -> None:
     cfg["bankroll"] = start_balance
     cfg["_peak_bankroll"] = start_balance
     logger.info("起始余额: %.2f %s", start_balance, cfg["currency"])
+    last_reset_date = datetime.now().date()
 
     round_count = 0
     while True:
         round_count += 1
         logger.info("\n%s — 第 %d 轮 (%s)", "─" * 50, round_count, datetime.now().strftime("%H:%M:%S"))
+
+        # 按日重置：新的一天 start_balance 重置为当前余额
+        today = datetime.now().date()
+        if today != last_reset_date:
+            try:
+                start_balance = client.get_balance(cfg["currency"]) or start_balance
+            except Exception:
+                pass
+            last_reset_date = today
+            _consec_losses = 0
+            logger.info("🔄 新的一天，日内亏损基准重置: %.2f", start_balance)
 
         # 更新余额
         try:
