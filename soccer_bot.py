@@ -20,7 +20,6 @@
 import argparse
 import json
 import logging
-import os
 import statistics
 import sys
 import time
@@ -36,8 +35,7 @@ import settings
 # ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 SOCCER_CONFIG = {
     # ── API ──────────────────────────────────────────────────
-    # "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
-    "api_key": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
+    "api_key": settings.CLOUDBET_API_KEY,
 
     "af_key": settings.API_FOOTBALL_KEY,   # 可选，来自 settings.py
     "currency": "USDT",
@@ -1084,13 +1082,14 @@ def main():
 
     if args.af_key:
         cfg["af_key"] = args.af_key
+        cfg["external_football_key"] = args.af_key
 
     if not cfg["api_key"]:
         logger.error(
             "未设置 Cloudbet API Key！\n"
             "  方式1: export CLOUDBET_API_KEY=your_key\n"
             "  方式2: python soccer_bot.py --api-key your_key\n"
-            "  方式3: 编辑 soccer_bot.py 中 SOCCER_CONFIG['api_key']"
+            "  方式3: 编辑 settings.py 中 CLOUDBET_API_KEY"
         )
         sys.exit(1)
 
