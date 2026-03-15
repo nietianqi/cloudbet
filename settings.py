@@ -9,7 +9,6 @@
     3. 先用 DRY_RUN = True 模拟观察，确认有信号后再真实下单
 """
 
-import os
 
 # ================================================================
 # ① Cloudbet Trading API Key（必须）
@@ -18,7 +17,7 @@ import os
 # 格式：JWT Token（eyJ 开头的长字符串）
 #
 # 方式一：直接填写（推荐，最简单）
-CLOUDBET_API_KEY = os.environ.get("CLOUDBET_API_KEY", "")
+CLOUDBET_API_KEY = "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA"
 #
 # 方式二：环境变量（安全但需要每次设置）
 #   export CLOUDBET_API_KEY=your_trading_jwt_token
@@ -28,7 +27,11 @@ CLOUDBET_API_KEY = os.environ.get("CLOUDBET_API_KEY", "")
 # ================================================================
 # 来源：https://dashboard.api-football.com/
 # 免费层：100 次/天（够用于直播监控）
-API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "f5168d66f1b016876c537240592e4fc6")
+API_FOOTBALL_KEY = "f5168d66f1b016876c537240592e4fc6"
+
+# API-Basketball Key（可选，外部篮球实时比分）
+# 如与 API-Football 共用同一个 key，保持等于 API_FOOTBALL_KEY 即可。
+API_BASKETBALL_KEY = API_FOOTBALL_KEY
 
 # ================================================================
 # ③ API-Football 接入方式（直连 vs RapidAPI）

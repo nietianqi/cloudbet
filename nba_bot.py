@@ -39,8 +39,7 @@ import settings
 # ── 配置（统一从 settings.py 读取，修改配置请编辑 settings.py）────
 NBA_CONFIG = {
     # ── API ──────────────────────────────────────────────────
-    # "API_KEY": os.environ.get("CLOUDBET_API_KEY", ""),
-    "API_KEY":"eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
+    "API_KEY": settings.CLOUDBET_API_KEY,
 
     "CURRENCY": "USDT",            # 强制真实资金币种
     "BET_URL": "https://sports-api.cloudbet.com/pub/v3/bets/place",
@@ -100,7 +99,7 @@ NBA_CONFIG = {
     "REQUIRE_RELIABLE_SCORE": False,    # Feed 普遍缺比分，启用节奏估算回退
     "EXTERNAL_SCORE_ENABLED": True,     # 启用外部实时比分（API-BASKETBALL）
     "EXTERNAL_SCORE_PREFER": True,      # 外部比分命中时优先使用
-    "EXTERNAL_BASKETBALL_KEY": os.environ.get("API_BASKETBALL_KEY", os.environ.get("API_FOOTBALL_KEY", "")),
+    "EXTERNAL_BASKETBALL_KEY": settings.API_BASKETBALL_KEY,
     "EXTERNAL_SCORE_MIN_CONFIDENCE": 0.80,
     "EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS": 240,
     "EXTERNAL_SCORE_CACHE_TTL_SECS": 45,
@@ -958,7 +957,7 @@ def main():
             "未设置 API Key！\n"
             "方式1: 设置环境变量 CLOUDBET_API_KEY\n"
             "方式2: 运行 python nba_bot.py --api-key your_key\n"
-            "方式3: 编辑 nba_bot.py 中 NBA_CONFIG['API_KEY']"
+            "方式3: 编辑 settings.py 中 CLOUDBET_API_KEY"
         )
         sys.exit(1)
 
