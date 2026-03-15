@@ -5,7 +5,9 @@
       "Bash(python:*)",
       "Bash(git init:*)",
       "Bash(git remote add:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(find /f/cloudbet -maxdepth 2 -name .env* -o -name *example* -o -name *template*)",
+      "Bash(ls -la /f/cloudbet/.env*)"
     ],
     "deny": [],
     "ask": []
