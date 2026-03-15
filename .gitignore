@@ -36,3 +36,6 @@ credentials.json
 *.db-wal
 *.db-shm
 pytest-cache-files-*/
+.pytest_tmp/
+.tmp/
+.tmp/pytest-of-*/
