@@ -29,14 +29,11 @@ from typing import Dict, List, Optional, Tuple
 
 from cloudbet_client import CloudbetClient
 from soccer_model import InPlayGoalsModel, kelly_stake
-from xg_client import create_xg_client, estimate_xg_from_score_and_time
+from xg_client import create_xg_client, estimate_xg_from_score_and_time, APIFootballClient
 from external_scores import fetch_football_live_scores, match_external_score_for_event
 import live_db
 
 logger = logging.getLogger(__name__)
-
-# ── fixture_matcher 单例（跨轮询复用，保留 60 秒缓存）────────
-_fixture_matcher: Optional[FixtureMatcher] = None
 
 # ── 赔率历史缓存（用于稳定性检测）────────────────────────────
 # {event_id: [(timestamp, over_price, under_price), ...]}
@@ -129,7 +126,7 @@ def _get_live_xg(
     """
     game_state = {"red_cards_home": 0, "red_cards_away": 0}
 
-    if af_fixture_id and not isinstance(xg_client, type(None)):
+    if af_fixture_id and isinstance(xg_client, APIFootballClient):
         try:
             stats = xg_client.get_fixture_statistics(af_fixture_id)
             events_info = xg_client.get_events_info(af_fixture_id)
@@ -366,11 +363,6 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     """
     client = CloudbetClient(cfg["api_key"])
     xg_client = create_xg_client(cfg.get("af_key"))
-
-    # 单例：首次创建后跨轮询复用（保留 60 秒 fixture 缓存）
-    global _fixture_matcher
-    if _fixture_matcher is None:
-        _fixture_matcher = FixtureMatcher(xg_client)
 
     edge_threshold = cfg.get("edge_threshold", 0.06)
     min_remaining = cfg.get("min_remaining_minutes", 8.0)
