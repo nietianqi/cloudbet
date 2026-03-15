@@ -311,8 +311,8 @@ def create_xg_client(api_key: str = None, provider: str = None) -> "APIFootballC
         or os.environ.get("APIFOOTBALL_KEY", "")
     )
     if key:
-        logger.info("使用 API-Football 真实 xG 数据 (provider=%s)", prov)
-        return APIFootballClient(key, provider=prov)
+        logger.info("使用 API-Football 真实 xG 数据 (provider=%s)", provider)
+        return APIFootballClient(key, provider=provider)
     logger.warning("未配置 API_FOOTBALL_KEY，使用先验估算（xG 近似精度较低）")
     return NullXGClient()
 
