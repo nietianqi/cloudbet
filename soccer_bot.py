@@ -39,7 +39,7 @@ SOCCER_CONFIG = {
     # "api_key": os.environ.get("CLOUDBET_API_KEY", ""),
     "api_key": "eyJhbGciOiJSUzI1NiIsImtpZCI6IkhKcDkyNnF3ZXBjNnF3LU9rMk4zV05pXzBrRFd6cEdwTzAxNlRJUjdRWDAiLCJ0eXAiOiJKV1QifQ.eyJhY2Nlc3NfdGllciI6InRyYWRpbmciLCJleHAiOjE5OTYyMzk5ODIsImlhdCI6MTY4MDg3OTk4MiwianRpIjoiNDM2Yzc1NjgtMTM0Ny00MDJhLTg4ZDMtZDlhZmU3OGQ1MDdiIiwic3ViIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIiwidGVuYW50IjoiY2xvdWRiZXQiLCJ1dWlkIjoiNDM4MzY1YTUtMzQ0Yi00NTRmLWE5NmQtM2YyMWUzMDc1YmYwIn0.4eI0AK7z17EyutBgx_0FLUc9r5nWR_oUuiurGPyNlcGSz3853wkipm1ul_-oIlijPbaIha1UoD_2v3u-X48cJsmQglLNyst-2UPie9qQ3t8bzQUlhnHjcye7Kc-msGHNi-ML5twdRI-42sESiAECTccsB6NVebHgCqZfAh9-PVT-Hmao4c9AJiyJ2NA5QOTcBz7BJR06MTC0ZMW5Yklm001eEaDYxpBAorDmvRg5GDldlCBuQfVcvip8Zkp0uPHuAu2TJTJrw7tMYXSn7CUWWlQ_oQ7Alb-AchSOLkk7y-eUfUtu7plYJnj50wBLs-NLBzjnV3ifUhDk0etB9HNebA",
 
-    "af_key": os.environ.get("API_FOOTBALL_KEY", ""),   # 可选
+    "af_key": settings.API_FOOTBALL_KEY,   # 可选，来自 settings.py
     "currency": "USDT",
     "dry_run": False,                   # 默认真实投注
 
@@ -80,7 +80,7 @@ SOCCER_CONFIG = {
     "edge_robust_min": 0.01,                 # 鲁棒 edge 至少 1%
     "external_score_enabled": True,     # 启用外部实时比分（API-FOOTBALL）
     "external_score_prefer": True,      # 外部比分可用时优先使用
-    "external_football_key": os.environ.get("API_FOOTBALL_KEY", ""),
+    "external_football_key": settings.API_FOOTBALL_KEY,
     "external_score_min_confidence": 0.80,
     "external_score_kickoff_tolerance_mins": 240,
     "external_score_cache_ttl_secs": 45,

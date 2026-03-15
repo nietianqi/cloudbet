@@ -856,14 +856,24 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                     skipped_for_fifa_tier += 1
                 else:
                     skipped_for_fifa_unknown += 1
-                logger.debug(
-                    "[%s] FIFA 联赛筛选跳过: reason=%s country=%s tier=%s key=%s",
-                    match_name,
-                    reason,
-                    country_slug or "?",
-                    league_tier if league_tier is not None else "?",
-                    comp_key or "?",
-                )
+                    # no_country / no_tier：用 WARNING 暴露，便于排查缺失映射
+                    logger.warning(
+                        "[%s] FIFA 联赛筛选-未识别: reason=%s country=%s tier=%s key=%s",
+                        match_name,
+                        reason,
+                        country_slug or "?",
+                        league_tier if league_tier is not None else "?",
+                        comp_key or "?",
+                    )
+                if reason in ("country_outside_top150", "tier_not_allowed"):
+                    logger.debug(
+                        "[%s] FIFA 联赛筛选跳过: reason=%s country=%s tier=%s key=%s",
+                        match_name,
+                        reason,
+                        country_slug or "?",
+                        league_tier if league_tier is not None else "?",
+                        comp_key or "?",
+                    )
                 continue
 
         # ── 提取 total_goals 市场 ──────────────────────────
