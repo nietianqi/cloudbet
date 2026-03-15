@@ -28,3 +28,8 @@ Thumbs.db
 # 敏感信息（如果有独立配置文件）
 .env
 credentials.json
+# Local test/dependency artifacts
+.deps/
+*.db-wal
+*.db-shm
+pytest-cache-files-*/

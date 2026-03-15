@@ -1,4 +1,4 @@
-"""
+﻿"""
 足球直播总进球信号生成模块
 =============================
 职责:
@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from cloudbet_client import CloudbetClient
 from soccer_model import InPlayGoalsModel, kelly_stake
 from xg_client import create_xg_client, estimate_xg_from_score_and_time
-from fixture_matcher import FixtureMatcher
+from external_scores import fetch_football_live_scores, match_external_score_for_event
 import live_db
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ _fixture_matcher: Optional[FixtureMatcher] = None
 # {event_id: [(timestamp, over_price, under_price), ...]}
 _odds_cache: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
 _CACHE_TTL = 300   # 5 分钟后清理过期赛事
+_competition_guard_cache = {"ts": 0.0, "bad": set(), "stats": {}}
 
 # ── 赛前先验来源（简化）─────────────────────────────────────
 # 正式部署应接入 Dixon-Coles 模型（基于历史数据）
@@ -155,6 +156,199 @@ def _get_live_xg(
     return est_h, est_a, game_state
 
 
+def _extract_match_state(event: Dict) -> Dict:
+    """
+    提取比赛比分与时间，并标记比分来源是否可靠。
+
+    仅在明确拿到比分字段时才认为 score_reliable=True，
+    避免把“未知比分”误判成 0-0 造成系统性偏差。
+    """
+    home_goals = 0
+    away_goals = 0
+    score_reliable = False
+    score_source = "unknown"
+
+    scores = event.get("scores") or {}
+    if isinstance(scores, dict):
+        h = scores.get("home")
+        a = scores.get("away")
+        if h is None:
+            h = scores.get("1")
+        if a is None:
+            a = scores.get("2")
+        if h is not None and a is not None:
+            try:
+                home_goals = int(h)
+                away_goals = int(a)
+                score_reliable = True
+                score_source = "scores"
+            except (TypeError, ValueError):
+                pass
+
+    if not score_reliable:
+        home_obj = event.get("home") or {}
+        away_obj = event.get("away") or {}
+        h = home_obj.get("score")
+        a = away_obj.get("score")
+        if h is not None and a is not None:
+            try:
+                home_goals = int(h)
+                away_goals = int(a)
+                score_reliable = True
+                score_source = "home_away"
+            except (TypeError, ValueError):
+                pass
+
+    if not score_reliable:
+        periods = event.get("periods") or []
+        if periods:
+            try:
+                h_sum = 0
+                a_sum = 0
+                has_any = False
+                for p in periods:
+                    hs = p.get("homeScore")
+                    as_ = p.get("awayScore")
+                    if hs is None or as_ is None:
+                        continue
+                    h_sum += int(hs)
+                    a_sum += int(as_)
+                    has_any = True
+                if has_any:
+                    home_goals = h_sum
+                    away_goals = a_sum
+                    score_reliable = True
+                    score_source = "periods"
+            except (TypeError, ValueError):
+                pass
+
+    elapsed = 0
+    clock = event.get("clock") or {}
+    elapsed_candidates = (
+        clock.get("elapsedSeconds"),
+        clock.get("elapsed"),
+        event.get("elapsedSeconds"),
+        event.get("elapsed"),
+    )
+    for raw in elapsed_candidates:
+        if raw in (None, ""):
+            continue
+        try:
+            secs = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if secs > 0:
+            elapsed = int(secs // 60)
+            break
+
+    if elapsed <= 0:
+        kickoff = event.get("cutoffTime") or event.get("startTime")
+        if kickoff:
+            try:
+                kickoff_dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00"))
+                if kickoff_dt.tzinfo is None:
+                    kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+                elapsed = max(0, int((datetime.now(timezone.utc) - kickoff_dt).total_seconds() // 60))
+            except (TypeError, ValueError):
+                pass
+
+    elapsed = max(0, min(elapsed, 130))
+    return {
+        "home_goals": home_goals,
+        "away_goals": away_goals,
+        "elapsed": elapsed,
+        "score_reliable": score_reliable,
+        "score_source": score_source,
+    }
+
+
+def _is_elapsed_blocked(elapsed: float, blocked_ranges: List) -> bool:
+    for item in blocked_ranges or []:
+        try:
+            start, end = item
+            if float(start) <= float(elapsed) < float(end):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _contains_blocked_keyword(*values: str, keywords: Optional[List[str]] = None) -> bool:
+    if not keywords:
+        return False
+    lowered_keywords = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not lowered_keywords:
+        return False
+    combined = " ".join(str(v or "").lower() for v in values)
+    return any(k in combined for k in lowered_keywords)
+
+
+def _impute_score_from_line(
+    line: float,
+    elapsed: float,
+    pre_xg_home: float,
+    pre_xg_away: float,
+) -> Tuple[int, int, bool]:
+    """
+    Conservative score imputation when feed score is missing.
+
+    Idea:
+      - Use game progress * live total line to approximate current total goals.
+      - Split home/away by pre-match xG ratio.
+    """
+    try:
+        line_val = float(line)
+        elapsed_val = float(elapsed)
+    except (TypeError, ValueError):
+        return 0, 0, False
+
+    if line_val <= 0 or elapsed_val <= 0:
+        return 0, 0, False
+
+    total_minutes = 90.0 if elapsed_val <= 90.0 else 96.0
+    progress = max(0.0, min(elapsed_val / total_minutes, 1.0))
+    estimated_total = max(0.0, progress * line_val)
+    total_goals = int(round(estimated_total))
+
+    prior_total = max(0.1, float(pre_xg_home) + float(pre_xg_away))
+    home_ratio = max(0.05, min(0.95, float(pre_xg_home) / prior_total))
+    home_goals = int(round(total_goals * home_ratio))
+    away_goals = max(0, total_goals - home_goals)
+    return home_goals, away_goals, True
+
+
+def _get_bad_competitions(cfg: Dict) -> Tuple[set, Dict[str, Dict]]:
+    if not cfg.get("competition_guard_enabled", True):
+        return set(), {}
+
+    refresh_secs = max(10, int(cfg.get("competition_guard_refresh_secs", 180)))
+    now_ts = time.time()
+    if now_ts - float(_competition_guard_cache.get("ts", 0.0)) < refresh_secs:
+        return (
+            set(_competition_guard_cache.get("bad", set())),
+            dict(_competition_guard_cache.get("stats", {})),
+        )
+
+    stats = live_db.get_recent_competition_performance(
+        sport="soccer",
+        window=int(cfg.get("competition_guard_window", 240)),
+        min_samples=int(cfg.get("competition_guard_min_samples", 5)),
+        db_file=cfg.get("db_file", "live_betting.db"),
+    )
+
+    min_roi = float(cfg.get("competition_guard_min_roi", -0.25))
+    min_wr = float(cfg.get("competition_guard_min_win_rate", 0.30))
+    bad = set()
+    for comp, st in stats.items():
+        if float(st.get("roi", 0.0)) <= min_roi or float(st.get("win_rate", 0.0)) < min_wr:
+            bad.add(str(comp))
+
+    _competition_guard_cache["ts"] = now_ts
+    _competition_guard_cache["bad"] = set(bad)
+    _competition_guard_cache["stats"] = dict(stats)
+    return bad, stats
+
+
 def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     """
     主信号生成函数（每个轮询周期调用）
@@ -186,35 +380,108 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
     kelly_fraction = cfg.get("kelly_fraction", 0.25)
     max_stake_pct = cfg.get("max_stake_pct", 0.005)
     min_stake = cfg.get("min_stake", 1.0)
+    min_elapsed_minutes = cfg.get("min_elapsed_minutes", 1.0)
     pre_xg_home = cfg.get("pre_xg_home", _DEFAULT_PRE_XG_HOME)
     pre_xg_away = cfg.get("pre_xg_away", _DEFAULT_PRE_XG_AWAY)
     live_weight = cfg.get("prior_weight_live", 0.65)
     db_file = cfg.get("db_file", "live_betting.db")
-    leagues = cfg.get("leagues", PRIORITY_LEAGUES)
+    require_reliable_score = bool(cfg.get("require_reliable_score", True))
+    allow_imputed_score = bool(cfg.get("allow_imputed_score", True))
+    imputed_score_min_elapsed = float(cfg.get("imputed_score_min_elapsed", 10.0))
+    imputed_score_extra_edge = float(cfg.get("imputed_score_extra_edge", 0.04))
+    imputed_score_stake_mult = max(0.1, min(1.0, float(cfg.get("imputed_score_stake_mult", 0.6))))
+    min_market_price = float(cfg.get("min_market_price", 1.70))
+    max_market_price = float(cfg.get("max_market_price", 2.10))
+    if max_market_price < min_market_price:
+        min_market_price, max_market_price = max_market_price, min_market_price
+    blocked_elapsed_ranges = cfg.get("blocked_elapsed_ranges", [(30.0, 45.0)])
+    competition_block_keywords = cfg.get("competition_block_keywords", [])
+    external_score_enabled = bool(cfg.get("external_score_enabled", True))
+    external_score_prefer = bool(cfg.get("external_score_prefer", True))
+    external_key = str(cfg.get("external_football_key") or cfg.get("af_key") or "")
+    external_min_confidence = float(cfg.get("external_score_min_confidence", 0.80))
+    external_kickoff_tolerance = int(cfg.get("external_score_kickoff_tolerance_mins", 240))
+    external_cache_ttl = int(cfg.get("external_score_cache_ttl_secs", 45))
+    external_timeout = int(cfg.get("external_score_timeout_secs", 10))
+    # None = 扫描全量足球联赛（由 CloudbetClient.get_all_live_soccer 内部处理）
+    leagues = cfg.get("leagues")
+    live_statuses = cfg.get("live_statuses", ["TRADING_LIVE", "TRADING"])
+    scan_progress_every = cfg.get("scan_progress_every", 25)
+    prefer_bulk_events_api = cfg.get("prefer_bulk_events_api", True)
+    bulk_from_hours = cfg.get("bulk_from_hours", 4)
+    bulk_to_hours = cfg.get("bulk_to_hours", 2)
+    hydrate_live_events = cfg.get("hydrate_live_events", False)
+    fallback_to_league_scan_on_bulk_failure = cfg.get("fallback_to_league_scan_on_bulk_failure", True)
 
-    # 拉取所有直播赛事
+    # ????????????? TRADING_LIVE + TRADING?
     live_events = client.get_all_live_soccer(
         markets=["soccer.total_goals", "soccer.match_odds"],
         priority_leagues=leagues,
+        live_statuses=live_statuses,
+        progress_every=scan_progress_every,
+        prefer_bulk_events_api=prefer_bulk_events_api,
+        bulk_from_hours=bulk_from_hours,
+        bulk_to_hours=bulk_to_hours,
+        hydrate_live_events=hydrate_live_events,
+        fallback_to_league_scan_on_bulk_failure=fallback_to_league_scan_on_bulk_failure,
     )
 
     if not live_events:
-        logger.info("足球: 无直播赛事")
+        logger.info("足球: 无符合状态赛事（过滤=%s）", live_statuses)
         return []
 
-    # ── 注入 API-Football fixture_id（使真实 xG 链路生效）────────
-    ext_matched, ext_total = _fixture_matcher.inject_fixture_ids(live_events)
-    logger.info("fixture 匹配 ext:%d/%d", ext_matched, ext_total)
+    status_count = defaultdict(int)
+    for event in live_events:
+        status_count[str(event.get("status", "UNKNOWN")).upper()] += 1
+    logger.info("足球: 获取赛事 %d 场，状态分布=%s", len(live_events), dict(status_count))
 
     model = InPlayGoalsModel(pre_xg_home, pre_xg_away, live_weight=live_weight)
     signals = []
+    skipped_for_elapsed = 0
+    skipped_for_unreliable_score = 0
+    skipped_for_price = 0
+    skipped_for_elapsed_block = 0
+    skipped_for_competition = 0
+    skipped_for_competition_keyword = 0
+    skipped_for_edge = 0
+    skipped_for_imputed_early = 0
+    external_match_count = 0
+    external_snapshot_count = 0
+    max_edge_seen = float("-inf")
+    bad_competitions, comp_stats = _get_bad_competitions(cfg)
+    if bad_competitions:
+        logger.info("联赛风控门控: bad_competitions=%d (样本窗=%d)", len(bad_competitions), int(cfg.get("competition_guard_window", 240)))
+
+    external_snapshots: List[Dict] = []
+    if external_score_enabled and external_key:
+        try:
+            external_snapshots = fetch_football_live_scores(
+                api_key=external_key,
+                cache_ttl_secs=external_cache_ttl,
+                timeout_secs=external_timeout,
+            )
+            external_snapshot_count = len(external_snapshots)
+            if external_snapshot_count > 0:
+                logger.info("外部足球比分源: snapshots=%d", external_snapshot_count)
+        except Exception as exc:
+            logger.warning("外部足球比分获取失败: %s", exc)
 
     for event in live_events:
+        if not isinstance(event, dict):
+            continue
+
         event_id = str(event.get("id", ""))
-        home_name = event.get("home", {}).get("name", "?")
-        away_name = event.get("away", {}).get("name", "?")
+        home_obj = event.get("home") or {}
+        away_obj = event.get("away") or {}
+        home_name = home_obj.get("name", "?")
+        away_name = away_obj.get("name", "?")
         match_name = f"{home_name} vs {away_name}"
-        comp_name = event.get("_competition_name", "")
+        comp_name = event.get("_competition_name", "") or event.get("competition", "")
+
+        if _contains_blocked_keyword(comp_name, match_name, keywords=competition_block_keywords):
+            skipped_for_competition_keyword += 1
+            logger.debug("[%s] 命中联赛关键词过滤: %s", match_name, comp_name)
+            continue
 
         # ── 提取 total_goals 市场 ──────────────────────────
         market = CloudbetClient.extract_total_goals_market(event)
@@ -230,8 +497,78 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         _update_odds_cache(event_id, over_price, under_price)
 
         # 同时写入 odds_snapshot 表（供 CLV 回测）
+        match_state = _extract_match_state(event)
+        goals_home = int(match_state["home_goals"])
+        goals_away = int(match_state["away_goals"])
+        elapsed = float(match_state["elapsed"])
+        score_reliable = bool(match_state["score_reliable"])
+        score_source = str(match_state["score_source"])
+        score_imputed = False
+        external_confidence = None
+
+        if external_snapshots and (external_score_prefer or not score_reliable):
+            matched = match_external_score_for_event(
+                event_home=home_name,
+                event_away=away_name,
+                event_kickoff=event.get("cutoffTime") or event.get("startTime"),
+                event_competition=comp_name,
+                snapshots=external_snapshots,
+                min_confidence=external_min_confidence,
+                kickoff_tolerance_mins=external_kickoff_tolerance,
+            )
+            if matched:
+                snap = matched["snapshot"]
+                goals_home = int(snap.get("home_score") or 0)
+                goals_away = int(snap.get("away_score") or 0)
+                ext_elapsed = int(snap.get("elapsed_minutes") or 0)
+                if ext_elapsed > 0:
+                    elapsed = float(ext_elapsed)
+                score_reliable = True
+                score_source = f"external:{snap.get('source', 'external')}"
+                external_confidence = float(matched.get("confidence") or 0.0)
+                score_imputed = False
+                external_match_count += 1
+
+        if not score_reliable and allow_imputed_score:
+            imp_h, imp_a, ok = _impute_score_from_line(
+                line=line,
+                elapsed=elapsed,
+                pre_xg_home=pre_xg_home,
+                pre_xg_away=pre_xg_away,
+            )
+            if ok:
+                goals_home, goals_away = imp_h, imp_a
+                score_reliable = True
+                score_source = "imputed_from_line"
+                score_imputed = True
+
+        if require_reliable_score and not score_reliable:
+            skipped_for_unreliable_score += 1
+            logger.debug("[%s] 比分来源不可靠(%s)，跳过", match_name, score_source)
+            continue
+
+        if score_imputed and elapsed < imputed_score_min_elapsed:
+            skipped_for_imputed_early += 1
+            logger.debug(
+                "[%s] 比分为估算且 elapsed=%.1f < %.1f，跳过",
+                match_name,
+                elapsed,
+                imputed_score_min_elapsed,
+            )
+            continue
+
+        # ?????????? TRADING ???elapsed ??????????
+        if elapsed < float(min_elapsed_minutes):
+            skipped_for_elapsed += 1
+            logger.debug(
+                "[%s] elapsed=%.1f < %.1f???",
+                match_name,
+                elapsed,
+                float(min_elapsed_minutes),
+            )
+            continue
+
         try:
-            goals_home, goals_away, elapsed = CloudbetClient.extract_match_score(event)
             live_db.insert_odds_snapshot(
                 {
                     "event_id": event_id,
@@ -239,7 +576,7 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                     "competition": comp_name,
                     "home_team": home_name,
                     "away_team": away_name,
-                    "status": "TRADING_LIVE",
+                    "status": str(event.get("status", "UNKNOWN")).upper(),
                     "market_url": market.get("over_url", ""),
                     "line": line,
                     "over_price": over_price,
@@ -250,9 +587,9 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 db_file=db_file,
             )
         except Exception as exc:
-            logger.debug("写 odds_snapshot 失败: %s", exc)
+            logger.debug("? odds_snapshot ??: %s", exc)
 
-        # ── 稳定性检查 ────────────────────────────────────
+        # ?? ????? ????????????????????????????????????
         stable, stable_reason = _is_odds_stable(event_id, stable_window, jump_threshold)
         if not stable:
             logger.debug("[%s] 盘口不稳定: %s，跳过", match_name, stable_reason)
@@ -266,6 +603,24 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         if remaining_minutes < min_remaining:
             logger.debug("[%s] 剩余 %.1f 分钟 < 最低 %.1f，跳过",
                          match_name, remaining_minutes, min_remaining)
+            continue
+
+        if _is_elapsed_blocked(elapsed, blocked_elapsed_ranges):
+            skipped_for_elapsed_block += 1
+            logger.debug("[%s] 分钟 %.1f 命中历史亏损时段过滤，跳过", match_name, elapsed)
+            continue
+
+        if comp_name in bad_competitions:
+            skipped_for_competition += 1
+            st = comp_stats.get(comp_name, {})
+            logger.debug(
+                "[%s] 联赛风控跳过: %s (n=%s roi=%+.3f wr=%.2f)",
+                match_name,
+                comp_name,
+                st.get("samples", 0),
+                float(st.get("roi", 0.0)),
+                float(st.get("win_rate", 0.0)),
+            )
             continue
 
         # ── 获取 xG 数据 ──────────────────────────────────
@@ -285,24 +640,45 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
             live_xg_h, live_xg_a, elapsed, game_state
         )
 
-        if signal_info is None or signal_info["edge"] < edge_threshold:
+        if signal_info:
+            max_edge_seen = max(max_edge_seen, float(signal_info.get("edge") or float("-inf")))
+        effective_edge_threshold = edge_threshold + (imputed_score_extra_edge if score_imputed else 0.0)
+        if signal_info is None or signal_info["edge"] < effective_edge_threshold:
+            skipped_for_edge += 1
             if signal_info:
                 logger.debug(
-                    "[%s] edge=%.3f < 阈值 %.3f，跳过",
-                    match_name, signal_info["edge"], edge_threshold
+                    "[%s] edge=%.3f < 阈值 %.3f（%s），跳过",
+                    match_name,
+                    signal_info["edge"],
+                    effective_edge_threshold,
+                    score_source,
                 )
+            continue
+
+        market_price = float(signal_info.get("market_price") or 0.0)
+        if market_price < min_market_price or market_price > max_market_price:
+            skipped_for_price += 1
+            logger.debug(
+                "[%s] 赔率 %.3f 不在策略区间 [%.2f, %.2f]，跳过",
+                match_name,
+                market_price,
+                min_market_price,
+                max_market_price,
+            )
             continue
 
         # ── Kelly 仓位 ────────────────────────────────────
         stake = kelly_stake(
             edge=signal_info["edge"],
             model_prob=signal_info["model_prob"],
-            odds=signal_info["market_price"],
+            odds=market_price,
             bankroll=bankroll,
             fraction=kelly_fraction,
             max_pct=max_stake_pct,
             min_stake=min_stake,
         )
+        if score_imputed:
+            stake = max(min_stake, round(float(stake) * imputed_score_stake_mult, 2))
 
         # 检查平台 maxStake 限制
         max_stake = signal_info.get("max_stake", 9999)
@@ -329,10 +705,15 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
                 "model_prob": signal_info["model_prob"],
                 "mkt_prob": signal_info["mkt_prob"],
                 "fair_price": signal_info["fair_price"],
+                "max_stake": signal_info.get("max_stake", 9999),
+                "min_stake": signal_info.get("min_stake", min_stake),
                 "elapsed_minutes": elapsed,
                 "remaining_minutes": round(remaining_minutes, 1),
                 "goals_home": goals_home,
                 "goals_away": goals_away,
+                "score_source": score_source,
+                "score_imputed": score_imputed,
+                "external_score_confidence": external_confidence,
                 "live_xg_home": round(live_xg_h, 3),
                 "live_xg_away": round(live_xg_a, 3),
                 "game_state": game_state,
@@ -342,9 +723,30 @@ def generate_soccer_signals(cfg: Dict) -> List[Dict]:
         )
 
     # 按 edge 降序排列
+    if not signals and skipped_for_elapsed > 0 and not cfg.get("af_key"):
+        logger.warning(
+            "?? Feed ?????????/???elapsed<%.1f: %d/%d?????? API_FOOTBALL_KEY????????",
+            float(min_elapsed_minutes),
+            skipped_for_elapsed,
+            len(live_events),
+        )
+
     signals.sort(key=lambda s: s["edge"], reverse=True)
     logger.info(
-        "足球扫描完成: %d 场直播 → %d 个候选信号", len(live_events), len(signals)
+        "足球扫描完成: %d 场直播 → %d 个候选信号 (ext:%d/%d skip:score=%d imputed_early=%d elapsed=%d edge=%d block=%d comp=%d comp_kw=%d price=%d max_edge=%.3f)",
+        len(live_events),
+        len(signals),
+        external_match_count,
+        external_snapshot_count,
+        skipped_for_unreliable_score,
+        skipped_for_imputed_early,
+        skipped_for_elapsed,
+        skipped_for_edge,
+        skipped_for_elapsed_block,
+        skipped_for_competition,
+        skipped_for_competition_keyword,
+        skipped_for_price,
+        (max_edge_seen if max_edge_seen != float("-inf") else 0.0),
     )
     return signals
 

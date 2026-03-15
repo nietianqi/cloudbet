@@ -1,4 +1,4 @@
-"""
+﻿"""
 SQLite 数据库管理 — 直播投注闭环日志
 ======================================
 四张核心表：
@@ -16,7 +16,7 @@ SQLite 数据库管理 — 直播投注闭环日志
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 DB_FILE = "live_betting.db"
@@ -107,12 +107,13 @@ CREATE INDEX IF NOT EXISTS idx_results_ref ON results (reference_id);
 # ── 连接 / 初始化 ─────────────────────────────────────────────
 
 def get_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_file)
+    conn = sqlite3.connect(db_file, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # 支持并发读
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
-
 
 def init_db(db_file: str = DB_FILE) -> None:
     """初始化数据库（首次运行时建表）"""
@@ -259,10 +260,16 @@ def update_order_status(
     """更新订单状态（ACCEPTED / REJECTED）"""
     conn = get_connection(db_file)
     if executed_price is not None:
-        conn.execute(
-            "UPDATE orders SET status=?, executed_price=? WHERE reference_id=?",
-            (status, executed_price, reference_id),
-        )
+        if str(status).upper() == "ACCEPTED":
+            conn.execute(
+                "UPDATE orders SET status=?, executed_price=?, reject_reason='' WHERE reference_id=?",
+                (status, executed_price, reference_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE orders SET status=?, executed_price=? WHERE reference_id=?",
+                (status, executed_price, reference_id),
+            )
     elif reject_reason:
         conn.execute(
             "UPDATE orders SET status=?, reject_reason=? WHERE reference_id=?",
@@ -277,43 +284,313 @@ def update_order_status(
     conn.close()
 
 
-def get_accepted_orders(db_file: str = DB_FILE) -> List[Dict]:
-    """返回所有已成交但尚未结算的订单"""
+def get_accepted_orders(
+    db_file: str = DB_FILE,
+    min_stake: float = 0.0,
+    limit: Optional[int] = None,
+    statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
+) -> List[Dict]:
+    """Return unsettled orders with requested statuses and positive stake."""
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED"]
+
+    placeholders = ",".join("?" for _ in status_list)
     conn = get_connection(db_file)
-    rows = conn.execute(
-        """
-        SELECT o.* FROM orders o
+    sql = f"""
+        SELECT o.*
+        FROM orders o
         LEFT JOIN results r ON o.reference_id = r.reference_id
-        WHERE o.status = 'ACCEPTED' AND r.id IS NULL
-        """
-    ).fetchall()
+        WHERE o.status IN ({placeholders})
+          AND r.id IS NULL
+          AND COALESCE(o.stake, 0) > ?
+    """
+    params: List = status_list + [float(min_stake)]
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
+    sql += " ORDER BY o.id ASC"
+    if limit is not None and int(limit) > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_rejection_rate(window: int = 100, db_file: str = DB_FILE) -> float:
-    """
-    计算最近 N 笔下注的拒单率（用于风险监控）
+def count_unsettled_accepted_orders(
+    db_file: str = DB_FILE,
+    min_stake: float = 0.0,
+    statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
+) -> int:
+    """Count unsettled orders with requested statuses and positive stake."""
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED"]
 
-    Cloudbet 条款：拒单率 > 80% 可能被标记
+    placeholders = ",".join("?" for _ in status_list)
+    conn = get_connection(db_file)
+    sql = f"""
+        SELECT COUNT(*) AS cnt
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE o.status IN ({placeholders})
+          AND r.id IS NULL
+          AND COALESCE(o.stake, 0) > ?
     """
+    params: List = status_list + [float(min_stake)]
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
+    row = conn.execute(sql, tuple(params)).fetchone()
+    conn.close()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def count_unsettled_orders_for_event(
+    event_id: str,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+) -> int:
+    """
+    Count unsettled orders for one event by statuses/sport.
+
+    Useful for event-level dedup to avoid repeat bets when previous orders
+    are still PENDING/ACCEPTED.
+    """
+    if not event_id:
+        return 0
+
+    status_list = [str(s).upper() for s in (statuses or ["ACCEPTED", "PENDING"]) if str(s).strip()]
+    if not status_list:
+        status_list = ["ACCEPTED", "PENDING"]
+
+    placeholders = ",".join("?" for _ in status_list)
+    where_parts = ["o.event_id = ?", f"o.status IN ({placeholders})", "r.id IS NULL"]
+    params: List = [str(event_id)] + status_list
+
+    if sport:
+        where_parts.append("o.sport = ?")
+        params.append(str(sport).lower())
+
+    where_clause = " AND ".join(where_parts)
+
     conn = get_connection(db_file)
     row = conn.execute(
-        """
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END) as rejected
-        FROM (
-            SELECT status FROM orders ORDER BY id DESC LIMIT ?
-        )
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE {where_clause}
         """,
-        (window,),
+        tuple(params),
     ).fetchone()
     conn.close()
-    if row and row["total"] > 0:
-        return row["rejected"] / row["total"]
-    return 0.0
+    return int(row["cnt"] or 0) if row else 0
 
+
+def has_open_order_for_event(
+    event_id: str,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+) -> bool:
+    """Return True when event has unsettled orders in requested statuses."""
+    return count_unsettled_orders_for_event(
+        event_id=event_id,
+        db_file=db_file,
+        sport=sport,
+        statuses=statuses,
+    ) > 0
+
+
+def auto_close_zero_stake_accepted_orders(db_file: str = DB_FILE) -> int:
+    """
+    Auto-close accepted orders that have zero stake and no settlement yet.
+
+    Returns:
+        Number of rows updated.
+    """
+    conn = get_connection(db_file)
+    cur = conn.execute(
+        """
+        UPDATE orders
+        SET status = 'AUTO_VOID',
+            reject_reason = COALESCE(reject_reason, 'AUTO_CLOSED_ZERO_STAKE')
+        WHERE id IN (
+            SELECT o.id
+            FROM orders o
+            LEFT JOIN results r ON o.reference_id = r.reference_id
+            WHERE o.status = 'ACCEPTED'
+              AND r.id IS NULL
+              AND COALESCE(o.stake, 0) <= 0
+        )
+        """
+    )
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
+
+
+
+def auto_expire_stale_pending_orders(
+    db_file: str = DB_FILE,
+    stale_minutes: float = 20.0,
+    sport: Optional[str] = None,
+    reason: str = "AUTO_STALE_PENDING_TIMEOUT",
+) -> int:
+    """
+    Auto-expire long-pending orders to avoid stale exposure blocking new entries.
+
+    Orders are marked as STALE_PENDING only when:
+      - status is PENDING
+      - no settlement row exists
+      - order timestamp is older than now - stale_minutes
+    """
+    try:
+        stale_minutes_val = float(stale_minutes)
+    except (TypeError, ValueError):
+        stale_minutes_val = 20.0
+    stale_minutes_val = max(stale_minutes_val, 0.0)
+
+    cutoff = (datetime.utcnow() - timedelta(minutes=stale_minutes_val)).isoformat() + "Z"
+
+    select_sql = """
+        SELECT o.id
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE o.status = 'PENDING'
+          AND r.id IS NULL
+          AND o.timestamp <= ?
+    """
+    select_params: List = [cutoff]
+    if sport:
+        select_sql += " AND o.sport = ?"
+        select_params.append(str(sport).lower())
+
+    conn = get_connection(db_file)
+    stale_ids = [row["id"] for row in conn.execute(select_sql, tuple(select_params)).fetchall()]
+    if not stale_ids:
+        conn.close()
+        return 0
+
+    placeholders = ",".join("?" for _ in stale_ids)
+    update_sql = f"""
+        UPDATE orders
+        SET status = 'STALE_PENDING',
+            reject_reason = CASE
+                WHEN COALESCE(TRIM(reject_reason), '') = '' THEN ?
+                ELSE reject_reason
+            END
+        WHERE id IN ({placeholders})
+    """
+    cur = conn.execute(update_sql, tuple([str(reason)] + stale_ids))
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
+def repair_pending_acceptance_rejections(db_file: str = DB_FILE) -> int:
+    """
+    Recover historically misclassified orders:
+    status=REJECTED but reason indicates PENDING_ACCEPTANCE.
+    """
+    conn = get_connection(db_file)
+    cur = conn.execute(
+        """
+        UPDATE orders
+        SET status = 'PENDING'
+        WHERE id IN (
+            SELECT o.id
+            FROM orders o
+            LEFT JOIN results r ON o.reference_id = r.reference_id
+            WHERE o.status = 'REJECTED'
+              AND r.id IS NULL
+              AND UPPER(COALESCE(o.reject_reason, '')) LIKE '%PENDING_ACCEPTANCE%'
+        )
+        """
+    )
+    conn.commit()
+    affected = int(cur.rowcount or 0)
+    conn.close()
+    return affected
+
+
+def get_rejection_stats(
+    window: int = 100,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    include_statuses: Optional[List[str]] = None,
+    rejected_statuses: Optional[List[str]] = None,
+) -> Dict:
+    """Return rejection stats for recent orders after filtering."""
+    include = [str(s).upper() for s in (include_statuses or ["ACCEPTED", "REJECTED"]) if str(s).strip()]
+    rejected = [str(s).upper() for s in (rejected_statuses or ["REJECTED"]) if str(s).strip()]
+    if not include:
+        include = ["ACCEPTED", "REJECTED"]
+    if not rejected:
+        rejected = ["REJECTED"]
+
+    where_parts: List[str] = []
+    params: List = []
+    if sport:
+        where_parts.append("sport = ?")
+        params.append(str(sport).lower())
+
+    inc_ph = ",".join("?" for _ in include)
+    where_parts.append(f"status IN ({inc_ph})")
+    params.extend(include)
+
+    # Historical bug compatibility: do not treat pending-acceptance responses as true rejects.
+    where_parts.append("NOT (status = 'REJECTED' AND UPPER(COALESCE(reject_reason, '')) LIKE '%PENDING_ACCEPTANCE%')")
+
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+    rej_ph = ",".join("?" for _ in rejected)
+
+    conn = get_connection(db_file)
+    sql = f"""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status IN ({rej_ph}) THEN 1 ELSE 0 END) as rejected
+        FROM (
+            SELECT status
+            FROM orders
+            WHERE {where_clause}
+            ORDER BY id DESC
+            LIMIT ?
+        )
+    """
+    row = conn.execute(sql, tuple(rejected + params + [int(window)])).fetchone()
+    conn.close()
+
+    total = int(row["total"] or 0) if row else 0
+    rejected_cnt = int(row["rejected"] or 0) if row else 0
+    rate = (rejected_cnt / total) if total > 0 else 0.0
+    return {"total": total, "rejected": rejected_cnt, "rate": rate}
+
+
+def get_rejection_rate(
+    window: int = 100,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+    include_statuses: Optional[List[str]] = None,
+    rejected_statuses: Optional[List[str]] = None,
+) -> float:
+    """Backward-compatible rejection-rate helper."""
+    stats = get_rejection_stats(
+        window=window,
+        db_file=db_file,
+        sport=sport,
+        include_statuses=include_statuses,
+        rejected_statuses=rejected_statuses,
+    )
+    return float(stats.get("rate", 0.0))
 
 # ── results ───────────────────────────────────────────────────
 
@@ -321,6 +598,16 @@ def insert_result(result_data: Dict, db_file: str = DB_FILE) -> None:
     """记录结算结果（含 CLV）"""
     now = datetime.utcnow().isoformat() + "Z"
     conn = get_connection(db_file)
+    ref_id = result_data.get("reference_id")
+    if ref_id:
+        existing = conn.execute(
+            "SELECT 1 FROM results WHERE reference_id=? LIMIT 1",
+            (ref_id,),
+        ).fetchone()
+        if existing:
+            conn.close()
+            return
+
     conn.execute(
         """
         INSERT INTO results
@@ -391,7 +678,166 @@ def get_recent_orders_count(minutes: int = 30, db_file: str = DB_FILE) -> int:
     return row["cnt"] if row else 0
 
 
-# ── 独立测试 ──────────────────────────────────────────────────
+# -- Risk Helpers ------------------------------------------------------------
+def get_recent_result_returns(
+    window: int = 80,
+    db_file: str = DB_FILE,
+    sport: Optional[str] = None,
+) -> List[float]:
+    """
+    Return recent settled bet returns as pnl / stake.
+    """
+    conn = get_connection(db_file)
+    sql = """
+        SELECT r.stake, r.pnl
+        FROM results r
+        LEFT JOIN orders o ON r.reference_id = o.reference_id
+        WHERE r.stake IS NOT NULL AND r.stake > 0
+          AND r.pnl IS NOT NULL
+    """
+    params: List = []
+    if sport:
+        sql += " AND o.sport = ?"
+        params.append(str(sport).lower())
+
+    sql += " ORDER BY r.id DESC LIMIT ?"
+    params.append(int(window))
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conn.close()
+
+    returns: List[float] = []
+    for row in rows:
+        try:
+            stake = float(row["stake"])
+            pnl = float(row["pnl"])
+        except (TypeError, ValueError):
+            continue
+        if stake > 0:
+            returns.append(pnl / stake)
+    return returns
+
+
+def get_open_exposure(
+    db_file: str = DB_FILE,
+    include_statuses: Optional[List[str]] = None,
+    sport: Optional[str] = None,
+) -> float:
+    """
+    Return total stake of unsettled orders by statuses/sport.
+    """
+    status_list = [
+        str(s).upper()
+        for s in (include_statuses or ["ACCEPTED", "PENDING"])
+        if str(s).strip()
+    ]
+    if not status_list:
+        status_list = ["ACCEPTED", "PENDING"]
+
+    status_ph = ",".join("?" for _ in status_list)
+    where_parts = [f"o.status IN ({status_ph})", "r.id IS NULL"]
+    params: List = list(status_list)
+    if sport:
+        where_parts.append("o.sport = ?")
+        params.append(str(sport).lower())
+
+    where_clause = " AND ".join(where_parts)
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(o.stake), 0) AS exposure
+        FROM orders o
+        LEFT JOIN results r ON o.reference_id = r.reference_id
+        WHERE {where_clause}
+        """,
+        tuple(params),
+    ).fetchone()
+    conn.close()
+    try:
+        return float(row["exposure"] or 0.0) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_recent_competition_performance(
+    sport: str = "soccer",
+    window: int = 240,
+    min_samples: int = 1,
+    db_file: str = DB_FILE,
+) -> Dict[str, Dict]:
+    """
+    Return per-competition performance stats from recent settled bets.
+
+    Notes:
+      - Competition is mapped from latest odds_snapshot of the same event_id.
+      - Output values: samples, total_stake, total_pnl, roi, wins, losses, win_rate.
+    """
+    sport_key = str(sport or "").lower()
+    if not sport_key:
+        return {}
+
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        """
+        WITH recent AS (
+            SELECT r.id, r.reference_id, r.pnl, r.stake
+            FROM results r
+            JOIN orders o ON o.reference_id = r.reference_id
+            WHERE o.sport = ?
+            ORDER BY r.id DESC
+            LIMIT ?
+        ),
+        event_comp AS (
+            SELECT os.event_id, os.competition
+            FROM odds_snapshot os
+            JOIN (
+                SELECT event_id, MAX(id) AS max_id
+                FROM odds_snapshot
+                WHERE sport = ?
+                GROUP BY event_id
+            ) x
+            ON os.event_id = x.event_id AND os.id = x.max_id
+        )
+        SELECT
+            COALESCE(ec.competition, 'UNKNOWN') AS competition,
+            COUNT(*) AS samples,
+            SUM(COALESCE(recent.stake, 0)) AS total_stake,
+            SUM(COALESCE(recent.pnl, 0)) AS total_pnl,
+            SUM(CASE WHEN COALESCE(recent.pnl, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN COALESCE(recent.pnl, 0) < 0 THEN 1 ELSE 0 END) AS losses
+        FROM recent
+        JOIN orders o ON o.reference_id = recent.reference_id
+        LEFT JOIN event_comp ec ON ec.event_id = o.event_id
+        GROUP BY COALESCE(ec.competition, 'UNKNOWN')
+        """,
+        (sport_key, int(max(1, window)), sport_key),
+    ).fetchall()
+    conn.close()
+
+    out: Dict[str, Dict] = {}
+    min_n = max(1, int(min_samples))
+    for row in rows:
+        samples = int(row["samples"] or 0)
+        if samples < min_n:
+            continue
+        total_stake = float(row["total_stake"] or 0.0)
+        total_pnl = float(row["total_pnl"] or 0.0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        win_base = max(1, wins + losses)
+        out[str(row["competition"] or "UNKNOWN")] = {
+            "samples": samples,
+            "total_stake": total_stake,
+            "total_pnl": total_pnl,
+            "roi": (total_pnl / total_stake) if total_stake > 0 else 0.0,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / win_base,
+        }
+    return out
+
+# -- Self Test ---------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     test_db = "test_live_betting.db"
@@ -464,3 +910,10 @@ if __name__ == "__main__":
 
     os.remove(test_db)
     print("测试通过，测试文件已清理")
+
+
+
+
+
+
+

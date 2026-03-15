@@ -215,7 +215,8 @@ def pick_best_side(model_result: Dict, min_edge: float) -> Dict:
 
 
 def kelly_stake(edge: float, odds: float, bankroll: float,
-                fraction: float = 0.25, max_pct: float = 0.005) -> float:
+                fraction: float = 0.25, max_pct: float = 0.005,
+                model_prob: float = None) -> float:
     """
     分数 Kelly 仓位计算
 
@@ -239,8 +240,11 @@ def kelly_stake(edge: float, odds: float, bankroll: float,
 
     b = odds - 1.0
     p = 0.5 + edge / 2.0   # 近似胜率（从 edge 反推）
-    q = 1.0 - p
+    if model_prob is not None:
+        p = float(model_prob)
 
+    p = max(1e-6, min(1.0 - 1e-6, p))
+    q = 1.0 - p
     full_kelly = (p * b - q) / b
     if full_kelly <= 0:
         return 0.0

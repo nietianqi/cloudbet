@@ -24,13 +24,13 @@ API 说明:
 
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-import requests
-
 from nba_model import compute_live_total_edge, pick_best_side, kelly_stake
+from cloudbet_client import CloudbetClient, CloudbetAPIError
+from external_scores import fetch_basketball_live_scores, match_external_score_for_event
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,15 @@ _DEFAULT_CONFIG = {
     "JUMP_THRESHOLD": 0.08,       # 盘口跳动 > 0.08 视为不稳定
     "PRIOR_WEIGHT": 0.45,         # 贝叶斯先验权重
     "KELLY_FRACTION": 0.25,       # 1/4 Kelly
-    "MAX_STAKE_PCT": 0.005,       # 单注最大 0.5% 资金
+    "MAX_STAKE_PCT": 0.01,        # 单注最大 1.0% 资金
     "MIN_STAKE": 1.0,             # 最小注额
+    "EXTERNAL_SCORE_ENABLED": True,
+    "EXTERNAL_SCORE_PREFER": True,
+    "EXTERNAL_BASKETBALL_KEY": "",
+    "EXTERNAL_SCORE_MIN_CONFIDENCE": 0.80,
+    "EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS": 240,
+    "EXTERNAL_SCORE_CACHE_TTL_SECS": 45,
+    "EXTERNAL_SCORE_TIMEOUT_SECS": 10,
 }
 
 # 全局赔率历史缓存（event_id → [(ts, over_price, under_price), ...]）
@@ -58,30 +65,163 @@ EVENTS_URL = "https://sports-api.cloudbet.com/pub/v2/odds/events"
 BET_HISTORY_URL = "https://sports-api.cloudbet.com/pub/v4/bets/history"
 
 
-def fetch_live_basketball_events(api_key: str) -> List[Dict]:
+def fetch_live_basketball_events(
+    api_key: str,
+    live_statuses: Optional[List[str]] = None,
+    bulk_from_hours: int = 4,
+    bulk_to_hours: int = 2,
+    prefer_bulk_events_api: bool = True,
+    fallback_to_league_scan_on_bulk_failure: bool = True,
+) -> List[Dict]:
     """
-    拉取所有 TRADING_LIVE 篮球赛事
+    ??????????? bulk events??????????????
+    """
+    client = CloudbetClient(api_key)
 
-    返回：competition list（原始 API 结构）
-    """
-    headers = {"X-API-Key": api_key}
-    params = {
-        "sport": "basketball",
-        "status": "TRADING_LIVE",
-        "markets": "basketball.totals",
-        "limit": 200,
-    }
+    if live_statuses is None:
+        live_statuses = ["TRADING_LIVE"]
+    allowed_statuses = {str(s).upper() for s in live_statuses if s}
+
+    if prefer_bulk_events_api:
+        try:
+            now_ts = int(time.time())
+            payload = client.get_events_by_time(
+                sport_key="basketball",
+                from_ts=now_ts - int(bulk_from_hours * 3600),
+                to_ts=now_ts + int(bulk_to_hours * 3600),
+                markets=["basketball.totals"],
+            )
+            raw_comps = payload.get("competitions", []) or []
+            total_comps = len(raw_comps)
+            scanned_events = 0
+            matched_events = 0
+            status_counter: Counter = Counter()
+            competitions: List[Dict] = []
+            scan_start = time.time()
+
+            logger.info(
+                "Basketball bulk scan started: competitions=%d window=-%dh/+%dh allowed=%s",
+                total_comps,
+                bulk_from_hours,
+                bulk_to_hours,
+                sorted(allowed_statuses) if allowed_statuses else "ALL",
+            )
+
+            for idx, comp in enumerate(raw_comps, start=1):
+                comp_key = comp.get("key") or ""
+                comp_name = comp.get("name") or comp_key
+                kept: List[Dict] = []
+
+                for event in comp.get("events", []) or []:
+                    status = str(event.get("status", "")).upper()
+                    scanned_events += 1
+                    if status:
+                        status_counter[status] += 1
+                    if allowed_statuses and status not in allowed_statuses:
+                        continue
+                    event["_competition_key"] = comp_key
+                    event["_competition_name"] = comp_name
+                    kept.append(event)
+                    matched_events += 1
+
+                if kept:
+                    competitions.append({"key": comp_key, "name": comp_name, "events": kept})
+
+                if idx % 20 == 0:
+                    logger.info(
+                        "Basketball bulk progress: %d/%d competitions events=%d matched=%d elapsed=%.1fs",
+                        idx,
+                        total_comps,
+                        scanned_events,
+                        matched_events,
+                        time.time() - scan_start,
+                    )
+
+            logger.info(
+                "Basketball bulk scan: competitions=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+                total_comps,
+                scanned_events,
+                matched_events,
+                sorted(allowed_statuses) if allowed_statuses else "ALL",
+                dict(status_counter),
+                time.time() - scan_start,
+            )
+            return competitions
+        except CloudbetAPIError as exc:
+            if not fallback_to_league_scan_on_bulk_failure:
+                logger.warning("Basketball bulk scan failed, skip this round: %s", exc)
+                return []
+            logger.warning("Basketball bulk scan failed, fallback to league scan: %s", exc)
+
     try:
-        resp = requests.get(EVENTS_URL, headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            return resp.json().get("competitions", [])
-        logger.warning("API 返回 %d: %s", resp.status_code, resp.text[:200])
-        return []
-    except requests.RequestException as exc:
-        logger.error("拉取赛事失败: %s", exc)
+        comp_resp = client.get_competitions("basketball")
+    except CloudbetAPIError as exc:
+        logger.warning("????????: %s", exc)
         return []
 
+    comp_keys = CloudbetClient.extract_competition_keys(comp_resp)
+    total_leagues = len(comp_keys)
+    scanned_events = 0
+    matched_events = 0
+    status_counter: Counter = Counter()
+    competitions: List[Dict] = []
+    scan_start = time.time()
 
+    logger.info(
+        "Basketball league scan started: leagues=%d allowed=%s",
+        total_leagues,
+        sorted(allowed_statuses) if allowed_statuses else "ALL",
+    )
+
+    for idx, comp_key in enumerate(comp_keys, start=1):
+        try:
+            data = client.get_events(comp_key, markets=["basketball.totals"], status=None)
+        except CloudbetAPIError as exc:
+            logger.debug("?????? %s: %s", comp_key, exc)
+            continue
+
+        kept: List[Dict] = []
+        for event in data.get("events", []) or []:
+            status = str(event.get("status", "")).upper()
+            scanned_events += 1
+            if status:
+                status_counter[status] += 1
+            if allowed_statuses and status not in allowed_statuses:
+                continue
+            event["_competition_key"] = comp_key
+            event["_competition_name"] = data.get("name", comp_key)
+            kept.append(event)
+            matched_events += 1
+
+        if kept:
+            competitions.append(
+                {
+                    "key": comp_key,
+                    "name": data.get("name", comp_key),
+                    "events": kept,
+                }
+            )
+
+        if idx % 20 == 0:
+            logger.info(
+                "Basketball league progress: %d/%d leagues events=%d matched=%d elapsed=%.1fs",
+                idx,
+                total_leagues,
+                scanned_events,
+                matched_events,
+                time.time() - scan_start,
+            )
+
+    logger.info(
+        "Basketball league scan: leagues=%d events=%d matched=%d allowed=%s seen=%s elapsed=%.1fs",
+        total_leagues,
+        scanned_events,
+        matched_events,
+        sorted(allowed_statuses) if allowed_statuses else "ALL",
+        dict(status_counter),
+        time.time() - scan_start,
+    )
+    return competitions
 def _extract_totals_market(markets: Dict) -> Optional[Dict]:
     """
     从市场字典中提取 basketball.totals（大小分）市场数据
@@ -90,41 +230,67 @@ def _extract_totals_market(markets: Dict) -> Optional[Dict]:
         {line, over_price, under_price, market_url_over, market_url_under}
         或 None
     """
+    from urllib.parse import parse_qs
+
     for market_key, market in markets.items():
         if "totals" not in market_key.lower():
             continue
-        for sub_key, sub in market.get("submarkets", {}).items():
-            over_price = under_price = line = None
+
+        for _, sub in market.get("submarkets", {}).items():
+            over_price = under_price = None
+            over_url = under_url = ""
+            line = None
+            line_key = "points"
+
             for sel in sub.get("selections", []):
-                outcome = sel.get("outcome", "").lower()
-                price = sel.get("price")
-                params = sel.get("params", "")  # e.g. "points=228.5"
-                if not price:
+                if sel.get("status") not in (None, "SELECTION_ENABLED"):
                     continue
-                # 解析盘口
-                if line is None and "points=" in params:
-                    try:
-                        from urllib.parse import parse_qs
-                        qs = parse_qs(params)
-                        line = float(qs["points"][0])
-                    except (KeyError, IndexError, ValueError):
-                        pass
+
+                outcome = str(sel.get("outcome", "")).lower()
+                if outcome not in ("over", "under"):
+                    continue
+
+                try:
+                    price = float(sel.get("price"))
+                except (TypeError, ValueError):
+                    continue
+
+                params = str(sel.get("params", ""))
+                if line is None and params:
+                    qs = parse_qs(params)
+                    for key in ("points", "total", "line"):
+                        if key in qs:
+                            try:
+                                line = float(qs[key][0])
+                                line_key = key
+                                break
+                            except (TypeError, ValueError, IndexError):
+                                continue
+
                 if outcome == "over":
                     over_price = price
-                elif outcome == "under":
+                    over_url = str(sel.get("url") or "")
+                else:
                     under_price = price
+                    under_url = str(sel.get("url") or "")
 
-            if over_price and under_price and line:
-                return {
-                    "line": line,
-                    "over_price": over_price,
-                    "under_price": under_price,
-                    "market_key": market_key,
-                    "market_url_over": f"{market_key}/over?points={line}",
-                    "market_url_under": f"{market_key}/under?points={line}",
-                }
+            if over_price is None or under_price is None or line is None:
+                continue
+
+            if not over_url:
+                over_url = f"{market_key}/over?{line_key}={line}"
+            if not under_url:
+                under_url = f"{market_key}/under?{line_key}={line}"
+
+            return {
+                "line": line,
+                "over_price": over_price,
+                "under_price": under_price,
+                "market_key": market_key,
+                "market_url_over": over_url,
+                "market_url_under": under_url,
+            }
     return None
-
 
 def _parse_current_score(event: Dict) -> Optional[int]:
     """
@@ -249,6 +415,16 @@ def _update_odds_cache(event_id: str, over_price: float, under_price: float) -> 
         _odds_cache.pop(eid, None)
 
 
+def _contains_blocked_keyword(*values: str, keywords: Optional[List[str]] = None) -> bool:
+    if not keywords:
+        return False
+    lowered_keywords = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not lowered_keywords:
+        return False
+    combined = " ".join(str(v or "").lower() for v in values)
+    return any(k in combined for k in lowered_keywords)
+
+
 def generate_signals(cfg: Dict) -> List[Dict]:
     """
     主信号生成函数 — 每个轮询周期调用一次
@@ -268,17 +444,64 @@ def generate_signals(cfg: Dict) -> List[Dict]:
     kelly_fraction = cfg["KELLY_FRACTION"]
     max_stake_pct = cfg["MAX_STAKE_PCT"]
     bankroll = cfg.get("BANKROLL", 100.0)
+    require_reliable_score = bool(cfg.get("REQUIRE_RELIABLE_SCORE", True))
+    blocked_keywords = cfg.get("COMPETITION_BLOCK_KEYWORDS", [])
+    min_market_price = float(cfg.get("MIN_MARKET_PRICE", 1.65))
+    max_market_price = float(cfg.get("MAX_MARKET_PRICE", 2.20))
+    imputed_score_min_elapsed = float(cfg.get("IMPUTED_SCORE_MIN_ELAPSED", 6.0))
+    imputed_score_extra_edge = float(cfg.get("IMPUTED_SCORE_EXTRA_EDGE", 0.03))
+    imputed_score_stake_mult = max(0.1, min(1.0, float(cfg.get("IMPUTED_SCORE_STAKE_MULT", 0.5))))
+    external_score_enabled = bool(cfg.get("EXTERNAL_SCORE_ENABLED", True))
+    external_score_prefer = bool(cfg.get("EXTERNAL_SCORE_PREFER", True))
+    external_key = str(cfg.get("EXTERNAL_BASKETBALL_KEY") or cfg.get("EXTERNAL_SCORE_KEY") or "")
+    external_min_confidence = float(cfg.get("EXTERNAL_SCORE_MIN_CONFIDENCE", 0.80))
+    external_kickoff_tolerance = int(cfg.get("EXTERNAL_SCORE_KICKOFF_TOLERANCE_MINS", 240))
+    external_cache_ttl = int(cfg.get("EXTERNAL_SCORE_CACHE_TTL_SECS", 45))
+    external_timeout = int(cfg.get("EXTERNAL_SCORE_TIMEOUT_SECS", 10))
+    if max_market_price < min_market_price:
+        min_market_price, max_market_price = max_market_price, min_market_price
 
-    competitions = fetch_live_basketball_events(api_key)
+    competitions = fetch_live_basketball_events(
+        api_key,
+        live_statuses=cfg.get("LIVE_STATUSES", ["TRADING_LIVE"]),
+        bulk_from_hours=cfg.get("BULK_FROM_HOURS", 4),
+        bulk_to_hours=cfg.get("BULK_TO_HOURS", 2),
+        prefer_bulk_events_api=cfg.get("PREFER_BULK_EVENTS_API", True),
+        fallback_to_league_scan_on_bulk_failure=cfg.get(
+            "FALLBACK_TO_LEAGUE_SCAN_ON_BULK_FAILURE", True
+        ),
+    )
     if not competitions:
         logger.info("无直播篮球赛事")
         return []
 
     signals = []
+    skipped_for_comp_keyword = 0
+    skipped_for_unreliable_score = 0
+    skipped_for_imputed_early = 0
+    skipped_for_price = 0
+    skipped_for_edge = 0
+    external_match_count = 0
+    external_snapshot_count = 0
+    max_edge_seen = float("-inf")
+    external_snapshots: List[Dict] = []
+
+    if external_score_enabled and external_key:
+        try:
+            external_snapshots = fetch_basketball_live_scores(
+                api_key=external_key,
+                cache_ttl_secs=external_cache_ttl,
+                timeout_secs=external_timeout,
+            )
+            external_snapshot_count = len(external_snapshots)
+            if external_snapshot_count > 0:
+                logger.info("External basketball scores loaded: snapshots=%d", external_snapshot_count)
+        except Exception as exc:
+            logger.warning("External basketball score fetch failed: %s", exc)
 
     for comp in competitions:
         comp_name = comp.get("name", "")
-        if "virtual" in comp_name.lower():
+        if _contains_blocked_keyword(comp_name, keywords=blocked_keywords):
             continue
 
         for event in comp.get("events", []):
@@ -287,6 +510,10 @@ def generate_signals(cfg: Dict) -> List[Dict]:
             away_name = event.get("away", {}).get("name", "N/A")
             match_name = f"{home_name} vs {away_name}"
             status = event.get("status", "")
+
+            if _contains_blocked_keyword(comp_name, match_name, keywords=blocked_keywords):
+                skipped_for_comp_keyword += 1
+                continue
 
             if status != "TRADING_LIVE":
                 continue
@@ -324,13 +551,46 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 continue
 
             current_score = _parse_current_score(event)
+            score_reliable = current_score is not None
+            score_imputed = False
+            score_source = "feed" if score_reliable else "missing"
+            external_confidence = None
+
+            if external_snapshots and (external_score_prefer or not score_reliable):
+                matched = match_external_score_for_event(
+                    event_home=home_name,
+                    event_away=away_name,
+                    event_kickoff=event.get("cutoffTime") or event.get("startTime"),
+                    event_competition=comp_name,
+                    snapshots=external_snapshots,
+                    min_confidence=external_min_confidence,
+                    kickoff_tolerance_mins=external_kickoff_tolerance,
+                )
+                if matched:
+                    snap = matched["snapshot"]
+                    home_score = int(snap.get("home_score") or 0)
+                    away_score = int(snap.get("away_score") or 0)
+                    current_score = home_score + away_score
+                    ext_elapsed = int(snap.get("elapsed_minutes") or 0)
+                    if ext_elapsed > 0:
+                        elapsed_minutes = min(float(ext_elapsed), 48.0)
+                        remaining_minutes = max(48.0 - elapsed_minutes, 0.0)
+                    score_reliable = True
+                    score_source = f"external:{snap.get('source', 'external')}"
+                    external_confidence = float(matched.get("confidence") or 0.0)
+                    external_match_count += 1
+            if not score_reliable and require_reliable_score:
+                skipped_for_unreliable_score += 1
+                continue
             if current_score is None:
-                # 无法获取实时比分，用先验节奏估算（保守处理）
+                if elapsed_minutes < imputed_score_min_elapsed:
+                    skipped_for_imputed_early += 1
+                    continue
                 expected_so_far = (elapsed_minutes / 48.0) * line
                 current_score = round(expected_so_far)
-                logger.debug(
-                    "[%s] 无实时比分，估算当前总分=%d", match_name, current_score
-                )
+                score_imputed = True
+                score_source = "imputed_from_line"
+                logger.debug("[%s] 无实时比分，估算当前总分=%d", match_name, current_score)
 
             # ── 模型计算 ──────────────────────────────────────
             try:
@@ -347,8 +607,15 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 continue
 
             # ── 信号筛选 ──────────────────────────────────────
-            signal_info = pick_best_side(model_result, min_edge=edge_threshold)
+            effective_edge_threshold = edge_threshold + (imputed_score_extra_edge if score_imputed else 0.0)
+            signal_info = pick_best_side(model_result, min_edge=effective_edge_threshold)
             if signal_info is None:
+                max_edge_seen = max(
+                    max_edge_seen,
+                    float(model_result.get("edge_over") or float("-inf")),
+                    float(model_result.get("edge_under") or float("-inf")),
+                )
+                skipped_for_edge += 1
                 logger.debug(
                     "[%s] 无信号: edge_over=%.3f edge_under=%.3f",
                     match_name,
@@ -359,6 +626,9 @@ def generate_signals(cfg: Dict) -> List[Dict]:
 
             side = signal_info["side"]
             market_price = over_price if side == "over" else under_price
+            if market_price < min_market_price or market_price > max_market_price:
+                skipped_for_price += 1
+                continue
             market_url = (
                 markets_data["market_url_over"]
                 if side == "over"
@@ -372,10 +642,13 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                 bankroll=bankroll,
                 fraction=kelly_fraction,
                 max_pct=max_stake_pct,
+                model_prob=signal_info.get("model_prob"),
             )
             min_stake = cfg.get("MIN_STAKE", 1.0)
             if stake < min_stake:
                 stake = min_stake   # 满足平台最小注额
+            if score_imputed:
+                stake = max(min_stake, round(float(stake) * imputed_score_stake_mult, 2))
 
             signals.append(
                 {
@@ -398,6 +671,10 @@ def generate_signals(cfg: Dict) -> List[Dict]:
                     "elapsed_minutes": round(elapsed_minutes, 1),
                     "remaining_minutes": round(remaining_minutes, 1),
                     "current_score": current_score,
+                    "score_reliable": score_reliable,
+                    "score_source": score_source,
+                    "score_imputed": score_imputed,
+                    "external_score_confidence": external_confidence,
                     "model_result": model_result,
                     "stable_reason": stable_reason,
                 }
@@ -405,6 +682,18 @@ def generate_signals(cfg: Dict) -> List[Dict]:
 
     # 按 edge 降序排列，优先执行最强信号
     signals.sort(key=lambda s: s["edge"], reverse=True)
+    logger.info(
+        "Basketball signal scan: candidates=%d (ext:%d/%d skip:comp_kw=%d score=%d imputed_early=%d edge=%d price=%d max_edge=%.3f)",
+        len(signals),
+        external_match_count,
+        external_snapshot_count,
+        skipped_for_comp_keyword,
+        skipped_for_unreliable_score,
+        skipped_for_imputed_early,
+        skipped_for_edge,
+        skipped_for_price,
+        (max_edge_seen if max_edge_seen != float("-inf") else 0.0),
+    )
     return signals
 
 

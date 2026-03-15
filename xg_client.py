@@ -301,18 +301,15 @@ def create_xg_client(api_key: str = None, provider: str = None) -> "APIFootballC
     工厂函数：有 key 则用真实客户端，否则用 NullXGClient
 
     参数优先级:
-      1. 传入参数 api_key / provider
-      2. settings.py（API_FOOTBALL_KEY, APISPORTS_PROVIDER）
-      3. 环境变量 API_FOOTBALL_KEY
+      1. 传入参数 api_key
+      2. 环境变量 API_FOOTBALL_KEY
+      3. 兼容旧变量 APIFOOTBALL_KEY
     """
-    try:
-        import settings as _settings
-        key = api_key or _settings.API_FOOTBALL_KEY or os.environ.get("API_FOOTBALL_KEY", "")
-        prov = provider or _settings.APISPORTS_PROVIDER
-    except ImportError:
-        key = api_key or os.environ.get("API_FOOTBALL_KEY", "")
-        prov = provider or "direct"
-
+    key = (
+        api_key
+        or os.environ.get("API_FOOTBALL_KEY", "")
+        or os.environ.get("APIFOOTBALL_KEY", "")
+    )
     if key:
         logger.info("使用 API-Football 真实 xG 数据 (provider=%s)", prov)
         return APIFootballClient(key, provider=prov)
@@ -366,7 +363,7 @@ if __name__ == "__main__":
         print(f"  比分={gh}-{ga} | {min_}分 | est_xG={eh:.3f}/{ea:.3f}")
 
     # 如果有 key，测试真实 API
-    key = os.environ.get("API_FOOTBALL_KEY", "")
+    key = os.environ.get("API_FOOTBALL_KEY", "") or os.environ.get("APIFOOTBALL_KEY", "")
     if key:
         client = APIFootballClient(key)
         print("\n── API-Football 直播赛事 ────────")
@@ -378,4 +375,4 @@ if __name__ == "__main__":
             print(f"  统计数据({fid}): {stats}")
     else:
         print("\n未设置 API_FOOTBALL_KEY，跳过真实 API 测试")
-        print("设置方式: export API_FOOTBALL_KEY=your_key")
+        print("设置方式: export API_FOOTBALL_KEY=your_key (或旧变量 APIFOOTBALL_KEY)")
